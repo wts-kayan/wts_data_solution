@@ -1,0 +1,17 @@
+<workflow-app name="DoIt_Shell_HDFS" xmlns="uri:oozie:workflow:0.5">
+    <start to="shell-d4eb"/>
+    <kill name="Kill">
+        <message>L&#x27;action a échoué, message d&#x27;erreur[${wf:errorMessage(wf:lastErrorNode())}]</message>
+    </kill>
+    <action name="shell-d4eb">
+        <shell xmlns="uri:oozie:shell-action:0.1">
+            <job-tracker>${jobTracker}</job-tracker>
+            <name-node>${nameNode}</name-node>
+            <exec>submit.sh</exec>
+            <file>/Projects/STCreditRisk_UAT/MTA/runs/Oozie/DoIt_Shell_HDFS/submit.sh#submit.sh</file>
+        </shell>
+        <ok to="End"/>
+        <error to="Kill"/>
+    </action>
+    <end name="End"/>
+</workflow-app>
