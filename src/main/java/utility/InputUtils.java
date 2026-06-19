@@ -15,6 +15,7 @@ import org.apache.spark.sql.catalyst.TableIdentifier;
 import org.apache.spark.sql.catalyst.catalog.CatalogTable;
 import org.apache.spark.sql.catalyst.catalog.SessionCatalog;
 
+import scala.Option;
 import scala.Predef;
 import scala.collection.JavaConverters;
 
@@ -40,10 +41,11 @@ public class InputUtils {
         input = input.trim();
         runId = runId.trim();
 
-        SparkSession sparkSession = SparkSession.getActiveSession()
-                .getOrElse(() -> {
-                    throw new IllegalStateException("No active SparkSession found");
-                });
+        Option<SparkSession> activeSession = SparkSession.getActiveSession();
+        if (activeSession.isEmpty()) {
+            throw new IllegalStateException("No active SparkSession found");
+        }
+        SparkSession sparkSession = activeSession.get();
 
         Matcher m = TABLE_PATTERN.matcher(input);
         boolean tabPattern = m.matches();
