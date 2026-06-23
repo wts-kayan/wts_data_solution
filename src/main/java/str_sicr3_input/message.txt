@@ -1,0 +1,14 @@
+  Bonjour,
+
+  Aujourd'hui tous nos moteurs tournent en Spark 3.3.2 via la distribution CDP. Nous souhaitons faire évoluer certains traitements vers Spark 3.5.4.
+
+  Pourriez-vous installer Spark 3.5.4 sur le cluster (géré par CDP), tout en conservant Spark 3.3.2 pour l'existant ? L'idée est de pouvoir choisir la version au moment
+  du spark-submit.
+
+  Pourquoi on ne veut pas embarquer Spark 3.5.4 dans un fat jar :
+
+  - Conflit Hadoop : Spark 3.5.4 embarque Hadoop 3.3.x, alors que le cluster fournit Hadoop 3.1.1.7.1.9 (CDH 7.1.9) → erreurs NoSuchMethodError.
+  - Doublons de classes : embarquer Spark/Hadoop crée des LinkageError/ClassCastException imprévisibles.
+  - Jar surdimensionné et version Spark figée, impossible à patcher côté plateforme.
+  - Non aligné CDP : sort du périmètre supporté.
+
