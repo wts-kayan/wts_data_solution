@@ -1,4 +1,4 @@
-package utility;
+package str_sicr3_input.utility;
 
 import java.util.HashMap;
 import java.util.List;
