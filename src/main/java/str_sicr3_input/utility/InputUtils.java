@@ -1,5 +1,6 @@
 package str_sicr3_input.utility;
 
+import java.net.URI;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -12,6 +13,7 @@ import org.apache.hadoop.fs.Path;
 
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.TableIdentifier;
+import org.apache.spark.sql.catalyst.analysis.NoSuchPartitionException;
 import org.apache.spark.sql.catalyst.catalog.CatalogTable;
 import org.apache.spark.sql.catalyst.catalog.SessionCatalog;
 
@@ -56,37 +58,93 @@ public class InputUtils {
         SessionCatalog catalog = sparkSession.sessionState().catalog();
 
         if (tabPattern && catalog.tableExists(table)) {
-            return pathFromTable(catalog, table, runId);
+            return pathFromTable(sparkSession, catalog, table, runId);
         }
 
         return pathFromRawPath(sparkSession, input, runId);
     }
 
     /** Resolve the partition location from the catalog, matching the runId
-     *  partition column case-insensitively against the table's real schema. */
-    private static String pathFromTable(SessionCatalog catalog,
+     *  partition column case-insensitively against the table's real schema.
+     *
+     *  <p>When files are written straight to HDFS (e.g. a Spark write to the
+     *  partition path) without an {@code ALTER TABLE ... ADD PARTITION} /
+     *  {@code MSCK REPAIR}, the metastore has no partition entry and
+     *  {@code getPartition} throws {@link NoSuchPartitionException}. In that
+     *  case we fall back to the conventional Hive layout under the table
+     *  {@code LOCATION}, after verifying the directory actually exists. */
+    private static String pathFromTable(SparkSession sparkSession,
+                                        SessionCatalog catalog,
                                         TableIdentifier table,
                                         String runId) {
 
-        String runIdColumn = resolveRunIdColumn(catalog, table);
+        CatalogTable metadata = catalog.getTableMetadata(table);
+        String runIdColumn = resolveRunIdColumn(metadata);
 
         Map<String, String> partitionSpec = new HashMap<>();
         partitionSpec.put(runIdColumn, runId);
 
-        return catalog.getPartition(
-                        table,
-                        JavaConverters.mapAsScalaMapConverter(partitionSpec)
-                                .asScala()
-                                .toMap(Predef.conforms())
-                )
-                .location()
-                .getPath();
+        try {
+            return catalog.getPartition(
+                            table,
+                            JavaConverters.mapAsScalaMapConverter(partitionSpec)
+                                    .asScala()
+                                    .toMap(Predef.conforms())
+                    )
+                    .location()
+                    .getPath();
+        } catch (Exception e) {
+            // getPartition() comes from Scala, so NoSuchPartitionException is not
+            // visible as a thrown checked exception to javac; gate on instanceof
+            // and rethrow anything that is not a missing-partition error.
+            if (!(e instanceof NoSuchPartitionException)) {
+                if (e instanceof RuntimeException) {
+                    throw (RuntimeException) e;
+                }
+                throw new RuntimeException(e);
+            }
+            return partitionPathFromTableLocation(sparkSession, metadata, runIdColumn, runId);
+        }
+    }
+
+    /** Build the conventional partition path under the table LOCATION
+     *  ({@code <location>/<runIdColumn>=<runId>}) for partitions that exist on
+     *  the filesystem but are not registered in the metastore. Throws a clear
+     *  error when the directory is genuinely absent. */
+    private static String partitionPathFromTableLocation(SparkSession sparkSession,
+                                                         CatalogTable metadata,
+                                                         String runIdColumn,
+                                                         String runId) {
+
+        URI tableLocation = metadata.location();
+        String base = tableLocation.toString();
+        if (!base.endsWith("/")) {
+            base = base + "/";
+        }
+        String partitionPath = base + runIdColumn + "=" + runId;
+
+        try {
+            Configuration hadoopConf = sparkSession.sessionState().newHadoopConf();
+            Path candidate = new Path(partitionPath);
+            FileSystem fs = candidate.getFileSystem(hadoopConf);
+            if (!fs.exists(candidate)) {
+                throw new IllegalStateException(
+                        "Partition not registered in the metastore and no directory found on the "
+                                + "filesystem for " + runIdColumn + "=" + runId + " at " + partitionPath);
+            }
+        } catch (IllegalStateException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to verify fallback partition path on the filesystem: " + partitionPath, e);
+        }
+
+        return partitionPath;
     }
 
     /** Find the actual partition-column name on the table whose name equals
      *  "runId" ignoring case; fall back to the canonical key if absent. */
-    private static String resolveRunIdColumn(SessionCatalog catalog, TableIdentifier table) {
-        CatalogTable metadata = catalog.getTableMetadata(table);
+    private static String resolveRunIdColumn(CatalogTable metadata) {
         List<String> partitionColumns = JavaConverters
                 .seqAsJavaListConverter(metadata.partitionColumnNames())
                 .asJava();
