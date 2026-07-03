@@ -4,6 +4,19 @@
   HOW TO DEBUG THIS WORKFLOW
   ============================================================================
 
+ # 1. Does a 'spark3' sharelib even exist, and does it contain spark-core?
+  oozie admin -oozie http://<oozie-host>:11000/oozie -shareliblist
+  oozie admin -oozie http://<oozie-host>:11000/oozie -shareliblist spark3
+
+  # 2. Look on HDFS directly for spark-core in the spark3 sharelib:
+  hdfs dfs -ls /user/oozie/share/lib/lib_*/spark3/ | grep -i 'spark-core'
+
+  Two outcomes:
+  - spark3 is missing from the list, or the dir has no spark-core → the sharelib is not installed/populated. That's the root cause; an Oozie admin has to deploy the
+  Spark3 sharelib (oozie-setup.sh sharelib create / CDP parcel step). No workflow edit can fix an empty sharelib.
+  - spark3 exists with spark-core, but was recently added → Oozie is caching the old sharelib. Refresh it:
+  oozie admin -oozie http://<oozie-host>:11000/oozie -sharelibupdate
+
   1. FIND THE OOZIE JOB
      oozie jobs -oozie http://<oozie-host>:11000/oozie -jobtype wf -filter name=Projection
      oozie job  -oozie http://<oozie-host>:11000/oozie -info  <workflowId>
