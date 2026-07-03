@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!--
+  ============================================================================
+  HOW TO DEBUG THIS WORKFLOW
+  ============================================================================
+
+  1. FIND THE OOZIE JOB
+     oozie jobs -oozie http://<oozie-host>:11000/oozie -jobtype wf -filter name=Projection
+     oozie job  -oozie http://<oozie-host>:11000/oozie -info  <workflowId>
+     oozie job  -oozie http://<oozie-host>:11000/oozie -log   <workflowId>
+     # The -info output lists each action and its external YARN app id (the
+     # "Ext ID" column, e.g. application_1699999999999_1234).
+
+  2. GET THE DRIVER STACK TRACE (root cause lives here, not in the Oozie log)
+     # This is a spark3 action in mode=cluster, so the driver runs inside the
+     # YARN ApplicationMaster. The real exception is in the AM / driver log.
+     yarn logs -applicationId application_XXXX_YYYY > driver.log
+     yarn logs -applicationId application_XXXX_YYYY -log_files stdout,stderr
+     # Or open the Spark History Server / YARN ResourceManager UI:
+     #   http://s01vl9996524.fr.net.intra:8088/cluster/app/application_XXXX_YYYY
+     # In driver.log search for "User class threw exception" - the stack trace
+     # immediately after it is the actual failure (e.g.
+     # NoSuchPartitionException from InputUtils.pathFromTable).
+
+  3. CHECK THE ACTION CONFIGURATION OOZIE ACTUALLY SUBMITTED
+     oozie job -oozie http://<oozie-host>:11000/oozie -definition   <workflowId>
+     oozie job -oozie http://<oozie-host>:11000/oozie -configcontent <workflowId>
+     # Confirms the resolved ${nameNode}, jar version, and the two <arg> paths
+     # below really point at the conf you expect.
+
+  4. VERIFY THE INPUTS THE JOB READS
+     hdfs dfs -cat <conf.properties path from arg[0]>          # inspect config
+     hdfs dfs -ls  <table LOCATION>/runid=<runId>              # partition on disk?
+     beeline -e "SHOW PARTITIONS dbprojection.term_structure_detailed;"
+     # If the runid dir exists on HDFS but not in SHOW PARTITIONS, the metastore
+     # is out of sync - register it: ALTER TABLE ... ADD PARTITION (runid='...').
+
+  5. TURN UP LOGGING
+     # log4j2.properties is shipped via the <file> element and wired in through
+     # spark.{driver,executor}.extraJavaOptions below. Edit that file (raise the
+     # root/level or com.bnpp.itg loggers to DEBUG) and re-run to get more detail.
+     # spark.yarn.maxAppAttempts=1 means NO retry - one failure kills the job,
+     # which is convenient for reproducing a bug deterministically.
+
+  6. RE-RUN A SINGLE ACTION AFTER A FIX
+     oozie job -oozie http://<oozie-host>:11000/oozie -rerun <workflowId> \
+       -Doozie.wf.rerun.failnodes=true
+  ============================================================================
+-->
+<workflow-app xmlns="uri:oozie:workflow:1.0" name="Projection">
+    <credentials>
+        <credential name="hcat" type="hcat">
+            <property>
+                <name>hcat.metastore.uri</name>
+                <value>thrift://s01vl9996522.fr.net.intra:9083</value>
+            </property>
+            <property>
+                <name>hcat.metastore.principal</name>
+                <value>hive/s01vl9996522.fr.net.intra@SIT-INT-19499-101</value>
+            </property>
+        </credential>
+    </credentials>
+    <start to="spark-4f31"/>
+    <kill name="Kill">
+        <message>Action failed, error message[${wf:errorMessage(wf:lastErrorNode())}]</message>
+    </kill>
+    <action cred="hcat" name="spark-4f31">
+        <spark3 xmlns="uri:oozie:spark3-action:1.0">
+            <resource-manager>s01vl9996524.fr.net.intra:8032</resource-manager>
+            <name-node>${nameNode}</name-node>
+            <configuration>
+                <!-- Force the spark3 sharelib so Spark 3 jars (spark-core, which
+                     provides org.apache.spark.internal.Logging) are on the action
+                     classpath and not shadowed by a spark2 sharelib. -->
+                <property>
+                    <name>oozie.action.sharelib.for.spark</name>
+                    <value>spark3</value>
+                </property>
+                <!-- Debug the launcher: verbose classloading + DEBUG logs help
+                     pinpoint which jar/version a NoClassDefFoundError comes from. -->
+                <property>
+                    <name>oozie.launcher.mapreduce.map.log.level</name>
+                    <value>DEBUG</value>
+                </property>
+                <property>
+                    <name>oozie.launcher.mapreduce.map.java.opts</name>
+                    <value>-verbose:class</value>
+                </property>
+            </configuration>
+            <master>yarn</master>
+            <mode>cluster</mode>
+            <name>PROJ_IFRS9_TNR_202606_test_1891</name>
+            <class>com.bnpp.itg.fresh.str.runners.impl.RunProjection</class>
+            <jar>${nameNode}/Projects/STCreditRisk_UAT/MTA/runs/Projection/jars/str_projection_engine-7.7-RELEASE_us-888.jar</jar>
+            <spark-opts>--queue StEngine --conf spark.dynamicAllocation.enabled=true --conf spark.shuffle.service.enabled=true --conf spark.dynamicAllocation.initialExecutors=1 --conf spark.dynamicAllocation.minExecutors=1 --conf spark.dynamicAllocation.maxExecutors=3 --executor-memory=21G --executor-cores=3 --driver-memory=7G --driver-cores=1 --conf spark.executor.extraJavaOptions=-Dlog4j2.configurationFile=log4j2.properties --conf spark.driver.extraJavaOptions=-Dlog4j2.configurationFile=log4j2.properties --conf spark.yarn.maxAppAttempts=1</spark-opts>
+            <arg>/Projects/ST_CREDIT_RISK/TWIST_RECMOA/Projection_Conf_Output/Projection_Conf_Files/IFRS9_TNR_202606_test_1891_2026-07-02_16_31_27_272/conf.properties</arg>
+            <arg>/Projects/ST_CREDIT_RISK/TWIST_RECMOA/Projection_Conf_Output/Projection_Conf_Files/IFRS9_TNR_202606_test_1891_2026-07-02_16_31_27_272/workflow-projection.xml</arg>
+            <file>${nameNode}/Projects/STCreditRisk_UAT/log4j2.properties#log4j2.properties</file>
+        </spark3>
+        <ok to="End"/>
+        <error to="Kill"/>
+    </action>
+    <end name="End"/>
+</workflow-app>
