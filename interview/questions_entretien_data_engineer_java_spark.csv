@@ -1,4 +1,5 @@
-﻿Catégorie;Niveau;Question;Éléments de réponse attendus;Red flag
+﻿sep=;
+Catégorie;Niveau;Question;Éléments de réponse attendus;Red flag
 Java;Junior;Différence entre une ArrayList et une LinkedList : laquelle choisir dans un traitement batch ?;ArrayList = tableau contigu, accès O(1), itération rapide, cache-friendly. LinkedList = O(1) en insertion tête/queue mais mauvaise localité mémoire. En batch, ArrayList quasi toujours.;Répond 'LinkedList car insertion plus rapide' sans nuance sur l'itération.
 Java;Junior;Qu'est-ce qu'un objet immuable ? Comment en écrire un ? Pourquoi est-ce important en Spark ?;final class, champs final/private, pas de setter, copie défensive des collections. En Spark : sérialisation, partage entre threads, closures sans effet de bord.;Ne fait pas le lien avec la concurrence ou la sérialisation.
 Java;Confirmé;Expliquez equals/hashCode : que se passe-t-il si le contrat est violé dans une clé de jointure ou de groupBy ?;Contrat : equals égaux => hashCode égaux. Violation => doublons dans HashMap, shuffle incorrect, agrégations fausses et non déterministes.;Connaît la règle par coeur mais ne voit pas l'impact sur un partitionnement.
