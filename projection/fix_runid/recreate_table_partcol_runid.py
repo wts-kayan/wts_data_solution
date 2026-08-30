@@ -101,7 +101,67 @@ except NameError:
     from pyspark import SparkContext
     from pyspark.sql import SparkSession
     sc    = SparkContext.getOrCreate()
-    spark = SparkSession.builder.getOrCreate()
+    # enableHiveSupport() is REQUIRED: without it the session falls back to the
+    # in-memory catalog and no Hive table is visible at all -- every metastore
+    # call fails with TABLE_OR_VIEW_NOT_FOUND. Note that getOrCreate() returns
+    # an ALREADY-EXISTING session unchanged, so if a non-Hive session is live
+    # in this JVM you must restart the kernel for this to take effect.
+    spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+
+
+# ---------------------------------------------------------------------
+# Catalog pre-flight
+#   A missing table otherwise produces one stack trace per metastore call.
+#   Check it once, up front, and report what the session can actually see.
+# ---------------------------------------------------------------------
+
+def table_exists(name):
+    try:
+        return bool(spark.catalog.tableExists(name))
+    except Exception:                                           # noqa: BLE001
+        try:
+            spark.sql("DESCRIBE TABLE %s" % name).collect()
+            return True
+        except Exception:                                       # noqa: BLE001
+            return False
+
+
+def catalog_diagnostics(name):
+    """Why can't we see the table? Returns a list of report lines."""
+    out = []
+    impl = "<unknown>"
+    try:
+        impl = spark.conf.get("spark.sql.catalogImplementation", "<unset>")
+    except Exception:                                           # noqa: BLE001
+        pass
+    out.append("spark.sql.catalogImplementation = %s" % impl)
+
+    db = name.split(".")[0] if "." in name else None
+    try:
+        dbs = sorted(str(r[0]) for r in spark.sql("SHOW DATABASES").collect())
+        out.append("databases visible (%d): %s"
+                   % (len(dbs), ", ".join(dbs[:25]) + (" ..." if len(dbs) > 25 else "")))
+        if db and db not in dbs:
+            out.append("-> database %r is NOT in that list" % db)
+        elif db:
+            try:
+                tbs = sorted(str(r[1]) for r in spark.sql("SHOW TABLES IN %s" % db).collect())
+                out.append("tables in %s (%d): %s"
+                           % (db, len(tbs), ", ".join(tbs[:25]) + (" ..." if len(tbs) > 25 else "")))
+            except Exception as exc:                            # noqa: BLE001
+                out.append("SHOW TABLES IN %s failed: %s" % (db, exc))
+    except Exception as exc:                                    # noqa: BLE001
+        out.append("SHOW DATABASES failed: %s" % exc)
+
+    if impl != "hive":
+        out.append("-> this session has NO Hive support, so no Hive table can be found.")
+        out.append("   Restart the kernel and re-run: the bootstrap builds the session")
+        out.append("   with enableHiveSupport(), but getOrCreate() reuses an existing")
+        out.append("   non-Hive session unchanged.")
+    else:
+        out.append("-> Hive support is on, so check the database/table name against the")
+        out.append("   listing above (and current_catalog()/current_schema()).")
+    return out
 
 jvm  = spark._jvm
 conf = spark._jsc.hadoopConfiguration()
@@ -140,6 +200,15 @@ def describe_rows(sql):
 # ---------------------------------------------------------------------
 
 section("1/5  CAPTURE  (mode=%s, fix_mode=%s)  table=%s" % (MODE, FIX_MODE, HIVE_TABLE))
+
+# Everything below reads the table definition. If the table is not visible at
+# all, fail once with a useful message instead of one stack trace per query.
+if not table_exists(HIVE_TABLE):
+    raise RuntimeError(
+        "ABORT: table %s is not visible to this Spark session, so its definition "
+        "cannot be captured. Nothing was modified.\n  %s"
+        % (HIVE_TABLE, "\n  ".join(catalog_diagnostics(HIVE_TABLE))))
+log("OK", "table %s is visible to this session" % HIVE_TABLE)
 
 show_create = ""
 try:

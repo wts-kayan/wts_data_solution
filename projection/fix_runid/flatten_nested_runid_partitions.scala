@@ -316,6 +316,50 @@ log("INFO", s"stray entries at root            : ${strays.length}")
 //      * cross-check the metastore against the directory scan.
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// Catalog pre-flight
+//   A missing table otherwise produces one stack trace per metastore call.
+//   Check it once, up front, and report what the session can actually see.
+// ---------------------------------------------------------------------
+
+def tableExists(name: String): Boolean =
+  Try(spark.catalog.tableExists(name)).getOrElse(
+    Try { spark.sql(s"DESCRIBE TABLE $name").collect(); true }.getOrElse(false))
+
+/** Why can't we see the table? Returns a list of report lines. */
+def catalogDiagnostics(name: String): Seq[String] = {
+  val out  = ArrayBuffer[String]()
+  val impl = Try(spark.conf.get("spark.sql.catalogImplementation", "<unset>"))
+             .getOrElse("<unknown>")
+  out += s"spark.sql.catalogImplementation = $impl"
+
+  val db = if (name.contains(".")) name.substring(0, name.indexOf('.')) else null
+  Try {
+    val dbs = spark.sql("SHOW DATABASES").collect().map(_.get(0).toString).sorted
+    val shown = dbs.take(25).mkString(", ") + (if (dbs.length > 25) " ..." else "")
+    out += s"databases visible (${dbs.length}): $shown"
+    if (db != null && !dbs.contains(db)) {
+      out += s"-> database '$db' is NOT in that list"
+    } else if (db != null) {
+      Try {
+        val tbs = spark.sql(s"SHOW TABLES IN $db").collect().map(_.get(1).toString).sorted
+        val ts  = tbs.take(25).mkString(", ") + (if (tbs.length > 25) " ..." else "")
+        out += s"tables in $db (${tbs.length}): $ts"
+      }.failed.foreach(e => out += s"SHOW TABLES IN $db failed: ${e.getMessage}")
+    }
+  }.failed.foreach(e => out += s"SHOW DATABASES failed: ${e.getMessage}")
+
+  if (impl != "hive") {
+    out += "-> this session has NO Hive support, so no Hive table can be found."
+    out += "   The `spark` val from cell 1 must be built with Hive support enabled;"
+    out += "   restart the kernel if it was created without it."
+  } else {
+    out += "-> Hive support is on, so check the database/table name against the"
+    out += "   listing above (and current_catalog()/current_schema())."
+  }
+  out.toSeq
+}
+
 section(s"2/7  METASTORE PRE-FLIGHT  (table=$HIVE_TABLE)")
 
 var tableType: String = null      // "EXTERNAL" | "MANAGED" | null (undetermined)
@@ -333,7 +377,14 @@ def describeRows(sql: String): Seq[(String, String)] =
      Option(r.get(1)).map(_.toString).getOrElse(""))
   }.toSeq
 
-if (METASTORE_PREFLIGHT) {
+if (METASTORE_PREFLIGHT && !tableExists(HIVE_TABLE)) {
+  ddlExecutionAllowed = false
+  log("ERROR", s"table $HIVE_TABLE is NOT visible to this Spark session")
+  catalogDiagnostics(HIVE_TABLE).foreach(l => log("ERROR", "  " + l))
+  log("ERROR", "-> the HDFS flattening below can still run (it needs no metastore),")
+  log("ERROR", "   but NO partition DDL will be executed. Fix the table name or the")
+  log("ERROR", "   Hive support first if you want the metastore re-registered.")
+} else if (METASTORE_PREFLIGHT) {
   // --- guard 1: EXTERNAL vs MANAGED -----------------------------------
   Try {
     describeRows(s"DESCRIBE FORMATTED $HIVE_TABLE")
