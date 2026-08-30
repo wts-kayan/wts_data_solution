@@ -65,7 +65,13 @@ object CellTests {
       case e: Throwable if isMissingHadoopNative(e) =>
         skipped += 1
         nativeSkips += 1
-        println("SKIP (Hadoop native IO unavailable: Windows without winutils)")
+        println("SKIP (Hadoop native IO: NativeIO$POSIX.stat unavailable here)")
+        if (nativeSkips == 1) {
+          // print the call site once, so the cause is diagnosable rather than
+          // guessed at
+          println("      first occurrence, call site:")
+          e.getStackTrace.take(12).foreach(f => println("        " + f))
+        }
       case e: Throwable =>
         failures += ((name, String.valueOf(e.getMessage)))
         println("FAIL")
@@ -103,6 +109,12 @@ object CellTests {
       .config("spark.ui.enabled", "false")
       .config("spark.sql.shuffle.partitions", "2")
       .config("spark.hadoop.fs.defaultFS", "file:///")
+      // Hadoop's Windows hadoop.dll does not export the POSIX stat symbol that
+      // RawLocalFileSystem reaches for when native IO reports itself available,
+      // which surfaces as UnsatisfiedLinkError: NativeIO$POSIX.stat. Forcing
+      // the pure-Java fallback keeps the local filesystem usable. Irrelevant on
+      // Linux and on the cluster, where the native path works.
+      .config("spark.hadoop.io.native.lib.available", "false")
       .enableHiveSupport()
       .getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
@@ -150,8 +162,12 @@ object CellTests {
     finally s.close()
   }
 
+  /** The `default` database on purpose: CREATE DATABASE goes through
+    * Warehouse.mkdirs -> HdfsUtils.setFullFileStatus -> getGroup(), which
+    * needs the NativeIO POSIX stat symbol the Windows hadoop.dll lacks. */
+  private val DB = "default"
+
   private def createTable(db: String, table: String, root: JPath): Unit = {
-    spark.sql(s"CREATE DATABASE IF NOT EXISTS $db")
     spark.sql(s"DROP TABLE IF EXISTS $db.$table")
     spark.sql(
       s"""CREATE EXTERNAL TABLE $db.$table (
@@ -199,10 +215,10 @@ object CellTests {
       val wrapper = root.resolve("runId=bbb2")
       Files.createDirectories(wrapper)
       writeOrcPartition(wrapper, "runid", "bbb2", 2)
-      createTable("dbtest", "flat_dry", root)
+      createTable(DB, "flat_dry", root)
       val before = tree(root)
       generated.FlattenCell.run(spark, Map(
-        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> "dbtest.flat_dry",
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_dry",
         "DRY_RUN" -> "true", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-dry.sql")))
       assertEquals("tree must be untouched", before, tree(root))
     }
@@ -213,11 +229,11 @@ object CellTests {
       val wrapper = root.resolve("runId=bbb2")
       Files.createDirectories(wrapper)
       writeOrcPartition(wrapper, "runid", "bbb2", 3)
-      createTable("dbtest", "flat_apply", root)
-      addPartition("dbtest", "flat_apply", "aaa1", uri(root) + "/runId=aaa1")
-      addPartition("dbtest", "flat_apply", "bbb2", uri(root) + "/runId=bbb2/runid=bbb2")
+      createTable(DB, "flat_apply", root)
+      addPartition(DB, "flat_apply", "aaa1", uri(root) + "/runId=aaa1")
+      addPartition(DB, "flat_apply", "bbb2", uri(root) + "/runId=bbb2/runid=bbb2")
       generated.FlattenCell.run(spark, Map(
-        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> "dbtest.flat_apply",
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_apply",
         "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-apply.sql")))
       assertFalse("nested wrapper dir must be gone",
                   Files.exists(wrapper.resolve("runid=bbb2")))
@@ -225,7 +241,7 @@ object CellTests {
       assertTrue("data must sit directly under runId=bbb2/, got " + files,
                  files.exists(f => f.startsWith("runId=bbb2/") &&
                                    !f.startsWith("runId=bbb2/runid=")))
-      val locs = partitionLocations("dbtest", "flat_apply")
+      val locs = partitionLocations(DB, "flat_apply")
       assertTrue("metastore must point at the flattened dir, got " + locs("bbb2"),
                  locs("bbb2").endsWith("runId=bbb2"))
     }
@@ -235,8 +251,8 @@ object CellTests {
       val wrapper = root.resolve("runId=ccc3")
       Files.createDirectories(wrapper)
       writeOrcPartition(wrapper, "runid", "ccc3", 2)
-      createTable("dbtest", "flat_idem", root)
-      val cfg = Map("TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> "dbtest.flat_idem",
+      createTable(DB, "flat_idem", root)
+      val cfg = Map("TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_idem",
                     "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-idem.sql"))
       generated.FlattenCell.run(spark, cfg)
       val afterFirst = tree(root)
@@ -249,9 +265,9 @@ object CellTests {
       val wrapper = root.resolve("runId=ddd4")
       Files.createDirectories(wrapper)
       writeOrcPartition(wrapper, "runid", "eee5", 2)
-      createTable("dbtest", "flat_mm", root)
+      createTable(DB, "flat_mm", root)
       generated.FlattenCell.run(spark, Map(
-        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> "dbtest.flat_mm",
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_mm",
         "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-mm.sql")))
       assertTrue("mismatched nested dir must be left untouched",
                  Files.exists(wrapper.resolve("runid=eee5")))
@@ -265,15 +281,15 @@ object CellTests {
       if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
       val root = newRoot("rename")
       writeOrcPartition(root, "runid", "aaa1", 2)
-      createTable("dbtest", "ren", root)
-      addPartition("dbtest", "ren", "aaa1", uri(root) + "/runid=aaa1")
+      createTable(DB, "ren", root)
+      addPartition(DB, "ren", "aaa1", uri(root) + "/runid=aaa1")
       generated.RenameCell.run(spark, Map(
-        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> "dbtest.ren",
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.ren",
         "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-ren.sql")))
       assertTrue("runId=aaa1 must exist", Files.exists(root.resolve("runId=aaa1")))
       assertFalse("runid=aaa1 must be gone", Files.exists(root.resolve("runid=aaa1")))
       assertTrue("metastore must be re-pointed",
-                 partitionLocations("dbtest", "ren")("aaa1").endsWith("runId=aaa1"))
+                 partitionLocations(DB, "ren")("aaa1").endsWith("runId=aaa1"))
     }
 
     check("refuses a dir that still holds a nested runid=") {
@@ -281,9 +297,9 @@ object CellTests {
       val outer = root.resolve("runid=fff6")
       Files.createDirectories(outer)
       writeOrcPartition(outer, "runid", "fff6", 2)
-      createTable("dbtest", "ren_nested", root)
+      createTable(DB, "ren_nested", root)
       generated.RenameCell.run(spark, Map(
-        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> "dbtest.ren_nested",
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.ren_nested",
         "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-rn.sql")))
       assertTrue("still-nested dir must be left alone",
                  Files.exists(outer.resolve("runid=fff6")))
@@ -299,18 +315,18 @@ object CellTests {
     check("alter mode refuses to execute, leaves the table alone") {
       val root = newRoot("recreate-alter")
       writeOrcPartition(root, "runId", "aaa1", 2)
-      createTable("dbtest", "rec_alter", root)
-      addPartition("dbtest", "rec_alter", "aaa1", uri(root) + "/runId=aaa1")
-      val before = tblProps("dbtest.rec_alter")
+      createTable(DB, "rec_alter", root)
+      addPartition(DB, "rec_alter", "aaa1", uri(root) + "/runId=aaa1")
+      val before = tblProps(s"$DB.rec_alter")
       generated.RecreateCell.run(spark, Map(
-        "HIVE_TABLE" -> "dbtest.rec_alter", "TABLE_ROOT" -> uri(root),
+        "HIVE_TABLE" -> s"$DB.rec_alter", "TABLE_ROOT" -> uri(root),
         "DRY_RUN" -> "false", "FIX_MODE" -> "alter",
         "DDL_OUTPUT_PATH" -> ddl(root, "rec-alter.sql"),
         "BACKUP_OUTPUT_PATH" -> ddl(root, "rec-alter-backup.sql")))
       assertEquals("alter must not change the table properties",
-                   before, tblProps("dbtest.rec_alter"))
+                   before, tblProps(s"$DB.rec_alter"))
       assertEquals("alter must not drop partitions", 1L,
-                   spark.sql("SHOW PARTITIONS dbtest.rec_alter").count())
+                   spark.sql(s"SHOW PARTITIONS $DB.rec_alter").count())
       assertTrue("the DDL file must still be written for the beeline replay",
                  Files.exists(new File(new java.net.URI(
                    ddl(root, "rec-alter.sql"))).toPath))
@@ -321,60 +337,59 @@ object CellTests {
     check("recreate mode really sets partCol.0 = runId") {
       val root = newRoot("recreate-real")
       writeOrcPartition(root, "runId", "aaa1", 2)
-      createTable("dbtest", "rec_real", root)
-      addPartition("dbtest", "rec_real", "aaa1", uri(root) + "/runId=aaa1")
+      createTable(DB, "rec_real", root)
+      addPartition(DB, "rec_real", "aaa1", uri(root) + "/runId=aaa1")
       generated.RecreateCell.run(spark, Map(
-        "HIVE_TABLE" -> "dbtest.rec_real", "TABLE_ROOT" -> uri(root),
+        "HIVE_TABLE" -> s"$DB.rec_real", "TABLE_ROOT" -> uri(root),
         "DRY_RUN" -> "false", "FIX_MODE" -> "recreate",
         "DDL_OUTPUT_PATH" -> ddl(root, "rec-real.sql"),
         "BACKUP_OUTPUT_PATH" -> ddl(root, "rec-real-backup.sql")))
-      val cols = spark.table("dbtest.rec_real").schema.fieldNames
+      val cols = spark.table(s"$DB.rec_real").schema.fieldNames
       assertTrue("Spark's schema must carry the camelCase partition column, got " +
                  cols.mkString(","), cols.contains("runId"))
       assertTrue("the camelCase data columns must survive, got " + cols.mkString(","),
                  cols.contains("matrixMigrationName"))
       assertEquals("the partition must be re-registered", 1L,
-                   spark.sql("SHOW PARTITIONS dbtest.rec_real").count())
+                   spark.sql(s"SHOW PARTITIONS $DB.rec_real").count())
     }
 
     check("DRY_RUN leaves the metastore untouched") {
       val root = newRoot("recreate-dry")
       writeOrcPartition(root, "runId", "aaa1", 2)
-      createTable("dbtest", "rec_dry", root)
-      addPartition("dbtest", "rec_dry", "aaa1", uri(root) + "/runId=aaa1")
-      val before = tblProps("dbtest.rec_dry").get("spark.sql.sources.schema.partCol.0")
+      createTable(DB, "rec_dry", root)
+      addPartition(DB, "rec_dry", "aaa1", uri(root) + "/runId=aaa1")
+      val before = tblProps(s"$DB.rec_dry").get("spark.sql.sources.schema.partCol.0")
       generated.RecreateCell.run(spark, Map(
-        "HIVE_TABLE" -> "dbtest.rec_dry", "TABLE_ROOT" -> uri(root),
+        "HIVE_TABLE" -> s"$DB.rec_dry", "TABLE_ROOT" -> uri(root),
         "DRY_RUN" -> "true", "FIX_MODE" -> "recreate",
         "DDL_OUTPUT_PATH" -> ddl(root, "rec-dry.sql"),
         "BACKUP_OUTPUT_PATH" -> ddl(root, "rec-dry-backup.sql")))
       assertEquals("partCol.0 must be unchanged", before,
-                   tblProps("dbtest.rec_dry").get("spark.sql.sources.schema.partCol.0"))
+                   tblProps(s"$DB.rec_dry").get("spark.sql.sources.schema.partCol.0"))
       assertEquals("dry run must not drop partitions", 1L,
-                   spark.sql("SHOW PARTITIONS dbtest.rec_dry").count())
+                   spark.sql(s"SHOW PARTITIONS $DB.rec_dry").count())
     }
 
     check("aborts on a MANAGED table without touching it") {
-      spark.sql("CREATE DATABASE IF NOT EXISTS dbtest")
-      spark.sql("DROP TABLE IF EXISTS dbtest.rec_managed")
-      spark.sql("CREATE TABLE dbtest.rec_managed (a string) " +
+      s"DROP TABLE IF EXISTS $DB.rec_managed"
+      spark.sql(s"CREATE TABLE $DB.rec_managed (a string) " +
                 "PARTITIONED BY (runid string) STORED AS ORC")
       var msg = ""
       try {
         generated.RecreateCell.run(spark, Map(
-          "HIVE_TABLE" -> "dbtest.rec_managed", "DRY_RUN" -> "false",
+          "HIVE_TABLE" -> s"$DB.rec_managed", "DRY_RUN" -> "false",
           "FIX_MODE" -> "recreate"))
       } catch { case e: RuntimeException => msg = String.valueOf(e.getMessage) }
       assertTrue("must abort naming MANAGED, got: " + msg, msg.contains("MANAGED"))
       assertTrue("the managed table must still exist",
-                 spark.catalog.tableExists("dbtest.rec_managed"))
+                 spark.catalog.tableExists(s"$DB.rec_managed"))
     }
 
     check("aborts once, with diagnostics, on an invisible table") {
       var msg = ""
       try {
         generated.RecreateCell.run(spark, Map(
-          "HIVE_TABLE" -> "dbtest.does_not_exist_at_all",
+          "HIVE_TABLE" -> s"$DB.does_not_exist_at_all",
           "DRY_RUN" -> "true", "FIX_MODE" -> "recreate"))
       } catch { case e: RuntimeException => msg = String.valueOf(e.getMessage) }
       assertTrue("must name the invisible table, got: " + msg,
@@ -406,12 +421,16 @@ object CellTests {
     println(s"passed: $passed   failed: ${failures.size}   skipped: $skipped")
     if (nativeSkips > 0) {
       println("")
-      println(s"  $nativeSkips test(s) skipped because Hadoop's native IO is unavailable.")
-      println("  That is a Windows-without-winutils limitation of THIS machine, not a")
-      println("  defect in the scripts: Hive's directory operations call")
-      println("  NativeIO.POSIX.stat for permission info. To run them here, point")
-      println("  HADOOP_HOME at a winutils distribution matching Hadoop 3.x and put")
-      println("  %HADOOP_HOME%\\bin on PATH. On Linux (and on the cluster) they run.")
+      println(s"  $nativeSkips test(s) skipped on Hadoop's native IO. This is a Windows")
+      println("  limitation of THIS machine, not a defect in the scripts, and having")
+      println("  winutils installed does not fix it:")
+      println("    Hive creating a directory in the warehouse calls")
+      println("    HdfsUtils.setFullFileStatus -> getGroup() -> NativeIO$POSIX.stat,")
+      println("    and the Windows hadoop.dll does not export that POSIX symbol.")
+      println("  hadoop.dll cannot simply be unloaded either: without it even")
+      println("  RawLocalFileSystem.listStatus fails in NativeIO$Windows.access0.")
+      println("  Everything that does not create a warehouse directory runs fine, and")
+      println("  on Linux (and on the cluster) all of it runs.")
     }
     if (!caseSensitiveFs) {
       println("")

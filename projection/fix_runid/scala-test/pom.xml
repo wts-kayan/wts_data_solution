@@ -26,7 +26,38 @@
     <spark.version>3.5.4</spark.version>
     <maven.compiler.source>11</maven.compiler.source>
     <maven.compiler.target>11</maven.compiler.target>
+    <!-- Overridden by the hadoop-native profile below when HADOOP_HOME is set.
+         They default to inert -D flags so the argument list stays valid when
+         it is not. -->
+    <hadoopHomeArg>-Dfixrunid.hadoopHome=unset</hadoopHomeArg>
+    <hadoopLibArg>-Dfixrunid.hadoopLib=unset</hadoopLibArg>
   </properties>
+
+  <profiles>
+    <!-- Hive's CREATE DATABASE inherits permissions via HdfsUtils
+         .setFullFileStatus -> getGroup(), which takes the NATIVE path
+         (NativeIO$POSIX.stat) whenever hadoop.dll has been loaded. The Windows
+         hadoop.dll does not export that symbol, so loading it is precisely what
+         breaks the local filesystem; without it Hadoop falls back to
+         winutils.exe, which works.
+         hadoop.dll is still REQUIRED though: without it even
+         RawLocalFileSystem.listStatus fails, in NativeIO$Windows.access0. So
+         it is loaded here, and the tests simply avoid the one path that needs
+         the missing POSIX symbol: they use the pre-existing default
+         database rather than CREATE DATABASE. Only the MANAGED-table test,
+         which must create a table in the warehouse, still hits it.
+         On Linux none of this applies. -->
+    <profile>
+      <id>hadoop-native</id>
+      <activation>
+        <property><name>env.HADOOP_HOME</name></property>
+      </activation>
+      <properties>
+        <hadoopHomeArg>-Dhadoop.home.dir=${env.HADOOP_HOME}</hadoopHomeArg>
+        <hadoopLibArg>-Djava.library.path=${env.HADOOP_HOME}/bin</hadoopLibArg>
+      </properties>
+    </profile>
+  </profiles>
 
   <dependencies>
     <dependency>
@@ -134,6 +165,8 @@
           <arguments>
             <argument>-Xmx2g</argument>
             <argument>-Dfile.encoding=UTF-8</argument>
+            <argument>${hadoopHomeArg}</argument>
+            <argument>${hadoopLibArg}</argument>
             <argument>--add-opens=java.base/java.lang=ALL-UNNAMED</argument>
             <argument>--add-opens=java.base/java.lang.invoke=ALL-UNNAMED</argument>
             <argument>--add-opens=java.base/java.lang.reflect=ALL-UNNAMED</argument>

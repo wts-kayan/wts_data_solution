@@ -81,11 +81,19 @@ Both are limits of *this machine*, not of the scripts. The runner prints why.
 `runid=x` into one directory; HDFS does not. Tests that need both casings to
 coexist are skipped there. Run on any Linux box to exercise them.
 
-**Hadoop native IO.** Hive's directory operations call
-`NativeIO.POSIX.stat` for permission info, which needs `winutils.exe` /
-`hadoop.dll` on Windows. Without it those tests are skipped. To run them here,
-point `HADOOP_HOME` at a winutils distribution for Hadoop 3.x and put
-`%HADOOP_HOME%\bin` on `PATH`. On Linux and on the cluster they run normally.
+**Hadoop native IO on Windows.** One test is skipped, and *installing winutils
+does not fix it* — the build already picks up `HADOOP_HOME` when it is set:
+
+- Hive creating a directory in the warehouse calls
+  `HdfsUtils.setFullFileStatus` → `getGroup()` → `NativeIO$POSIX.stat`, and the
+  Windows `hadoop.dll` does not export that POSIX symbol.
+- `hadoop.dll` cannot just be left unloaded either: without it even
+  `RawLocalFileSystem.listStatus` fails, in `NativeIO$Windows.access0`.
+
+So the tests keep the DLL and avoid the one path that needs the missing symbol:
+they use the pre-existing `default` database instead of `CREATE DATABASE`. Only
+the MANAGED-table guard test, which must create a table in the warehouse, still
+hits it. On Linux none of this applies and all of it runs.
 
 A skip is never counted as a pass, and the exit code is non-zero only on a real
 failure.
