@@ -29,6 +29,7 @@
     <!-- Overridden by the hadoop-native profile below when HADOOP_HOME is set.
          They default to inert -D flags so the argument list stays valid when
          it is not. -->
+    <python.exe>python</python.exe>
     <hadoopHomeArg>-Dfixrunid.hadoopHome=unset</hadoopHomeArg>
     <hadoopLibArg>-Dfixrunid.hadoopLib=unset</hadoopLibArg>
   </properties>
@@ -154,6 +155,27 @@
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.6.3</version>
         <executions>
+          <!-- The wrappers are GENERATED from the cells, so they must be
+               regenerated before every compile. Left to the README this is a
+               footgun: `mvn -o test` on its own happily compiles and tests the
+               wrappers left over from the previous run. An edit to a cell (or
+               a deliberate check that a test can still fail) then silently
+               tests the old code and reports green. Binding generation to
+               generate-sources makes `mvn -o test` correct on its own.
+               Override -Dpython.exe=python3 if `python` is not the interpreter
+               on PATH. -->
+          <execution>
+            <id>generate-cell-wrappers</id>
+            <phase>generate-sources</phase>
+            <goals><goal>exec</goal></goals>
+            <configuration>
+              <executable>${python.exe}</executable>
+              <workingDirectory>${project.basedir}</workingDirectory>
+              <arguments>
+                <argument>generate_wrappers.py</argument>
+              </arguments>
+            </configuration>
+          </execution>
           <execution>
             <id>run-cell-tests</id>
             <phase>test</phase>

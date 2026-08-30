@@ -12,11 +12,16 @@ This harness compiles and runs them offline, in about a minute.
 
 ```bash
 cd projection/fix_runid/scala-test
-python generate_wrappers.py     # wrap the cells into compilable objects
-mvn -o test                     # compile + run
+mvn -o test
 ```
 
-or the one-liner: `./run.sh` (Git Bash / Linux) or `powershell -File run.ps1`.
+That is the whole command: wrapper generation is bound to `generate-sources`,
+so the cells are re-wrapped from source on every run. It used to be a separate
+`python generate_wrappers.py` step, which made `mvn -o test` on its own compile
+and test the wrappers left over from the previous run -- an edit to a cell
+would silently report green. `./run.sh` and `run.ps1` still work and do the
+same thing. Pass `-Dpython.exe=python3` if `python` is not the interpreter on
+PATH.
 
 `mvn -o` is **offline**: every dependency and plugin version in `pom.xml` was
 chosen because it is already in the local `~/.m2`. No network access is needed
@@ -25,7 +30,7 @@ or attempted.
 Compile only, when that is all you want:
 
 ```bash
-python generate_wrappers.py && mvn -o compile
+mvn -o compile
 ```
 
 ## How the wrapping works
@@ -65,9 +70,17 @@ resulting tree and metastore.
 
 | Cell | Checks |
 |---|---|
-| flatten | dry run changes nothing; `runId=X/runid=X` collapses to `runId=X` in one pass and the metastore is re-pointed; second apply is a no-op; a UUID mismatch is skipped, never merged |
-| rename | `runid=X` becomes `runId=X` and is re-pointed; a still-nested dir is refused |
-| recreate | dry run touches nothing; `alter` mode refuses to execute and leaves the table alone; `recreate` mode really lands `runId` in Spark's schema; aborts on MANAGED; aborts once, with diagnostics, on an invisible table |
+| flatten | dry run changes nothing; `runId=X/runid=X` collapses to `runId=X` in one pass and the metastore is re-pointed; second apply is a no-op; a UUID mismatch is skipped, never merged; a name collision on merge keeps both files; markers stay put and their dir survives; `DELETE_MARKERS_ON_MERGE=true` clears it |
+| rename | `runid=X` becomes `runId=X` and is re-pointed; a still-nested dir is refused; `MERGE_ON_COLLISION=false` refuses a colliding target; `MERGE_ON_COLLISION=true` loses no file, colliding or not |
+| recreate | dry run touches nothing; `alter` mode refuses to execute and leaves the table alone; `recreate` mode really lands `runId` in Spark's schema; aborts on MANAGED; aborts once, with diagnostics, on an invisible table; the backup replays the pre-drop definition; every partition is re-registered, not just the first |
+
+The merge tests are the ones that matter most, because merging is the only
+place the cells can lose data: files are moved into a directory that already
+holds files, and an HDFS rename onto an existing name fails. The cell renames
+the incoming file to `merged_<8hex>_<name>` instead. Those tests therefore
+assert on file *contents* -- real ORC written under a chosen name, carrying a
+tag that says which directory it came from -- rather than on a file count, and
+they read the partition back through the table afterwards.
 
 The local filesystem stands in for HDFS. That is faithful for what the cells do
 — they only ever go through the Hadoop `FileSystem` API, the same code path for
@@ -75,7 +88,7 @@ The local filesystem stands in for HDFS. That is faithful for what the cells do
 
 ## Environment notes (Windows)
 
-All 11 tests run on Windows. Two things had to be arranged for that, both
+All 18 tests run on Windows. Two things had to be arranged for that, both
 handled automatically:
 
 **Case sensitivity.** Telling `runId=` from `runid=` is the entire point, and
@@ -119,7 +132,7 @@ Worth stating, because it is the argument for keeping it:
 scala-test/
   pom.xml                  offline build, versions pinned to what is in ~/.m2
   generate_wrappers.py     cells -> compilable objects
-  run.sh / run.ps1         generate + mvn -o test
+  run.sh / run.ps1         thin wrappers around mvn -o test
   src/main/scala/
     generated/             GENERATED, do not edit
     com/bnp/runid/CellTests.scala

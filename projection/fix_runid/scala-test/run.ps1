@@ -1,7 +1,6 @@
-# Generate the cell wrappers, then compile and run them offline.
+# Compile and run the cell tests offline. Wrapper generation is bound to the
+# build's generate-sources phase, so `mvn -o test` re-wraps the cells itself.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-python generate_wrappers.py
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 mvn -o test
 exit $LASTEXITCODE

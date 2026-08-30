@@ -56,30 +56,35 @@ object CellTests {
     false
   }
 
+  /** The verdict is printed AFTER the body, with the name repeated: each cell
+    * writes a full report to stdout as it runs, so a name printed up front
+    * ends up hundreds of lines away from its own result. */
   private def check(name: String)(body: => Unit): Unit = {
-    print("  %-52s ".format(name))
+    def verdict(r: String): Unit = println("  %-6s %s".format(r, name))
     try {
       body
       passed += 1
-      println("PASS")
+      verdict("PASS")
     } catch {
       case Skip(why) =>
         skipped += 1
-        println("SKIP (" + why + ")")
+        verdict("SKIP")
+        println("         reason: " + why)
       case e: Throwable if isMissingHadoopNative(e) =>
         skipped += 1
         nativeSkips += 1
-        println("SKIP (Hadoop native IO: NativeIO$POSIX.stat unavailable here)")
+        verdict("SKIP")
+        println("         reason: Hadoop native IO, NativeIO$POSIX.stat unavailable here")
         if (nativeSkips == 1) {
           // print the call site once, so the cause is diagnosable rather than
           // guessed at
-          println("      first occurrence, call site:")
-          e.getStackTrace.take(12).foreach(f => println("        " + f))
+          println("         first occurrence, call site:")
+          e.getStackTrace.take(12).foreach(f => println("           " + f))
         }
       case e: Throwable =>
         failures += ((name, String.valueOf(e.getMessage)))
-        println("FAIL")
-        println("      " + e.toString.take(400).replace("\n", "\n      "))
+        verdict("FAIL")
+        println("         " + e.toString.take(400).replace("\n", "\n         "))
     }
   }
 
@@ -228,6 +233,52 @@ object CellTests {
 
   private def ddl(root: JPath, n: String) = uri(root.getParent.resolve(n))
 
+  /** One REAL ORC file, under a name the test chooses, carrying `tag` in its
+    * first column. The merge paths key on the file name -- a collision is only
+    * reachable when two directories hold the same name -- and Spark picks its
+    * own part-<uuid> names, so those paths need a file placed by hand. It has
+    * to be real ORC, not a stub: the cells re-read the table to verify, and a
+    * stub would make that verification fail for a reason the test did not
+    * intend. The tag is what tells two same-named files apart afterwards. */
+  private def writeNamedOrc(dir: JPath, name: String, tag: String): Unit = {
+    Files.createDirectories(dir)
+    val tmp = Files.createTempDirectory("orcgen-")
+    spark.range(1L)
+      .selectExpr(
+        s"'$tag' as matrixMigrationName",
+        "'2026-01-01' as asOfDate",
+        "'base' as scenario",
+        "'AA0' as notationCode")
+      .repartition(1)
+      .write.mode("overwrite").orc(tmp.resolve("out").toUri.toString)
+    val src = Files.list(tmp.resolve("out"))
+    try {
+      val one = src.iterator().asScala
+        .find(_.getFileName.toString.endsWith(".orc"))
+        .getOrElse(throw new IllegalStateException("no orc file was produced"))
+      Files.copy(one, dir.resolve(name))
+    } finally src.close()
+  }
+
+  private def writeMarker(dir: JPath, name: String): Unit = {
+    Files.createDirectories(dir)
+    Files.write(dir.resolve(name), Array.empty[Byte])
+  }
+
+  /** Every ORC file directly under `dir`, as name -> the tag it carries. Lets a
+    * merge assert that no file was lost AND that each one is still readable,
+    * rather than merely that some count matched. */
+  private def orcTags(dir: JPath): Map[String, String] = {
+    val s = Files.list(dir)
+    try s.iterator().asScala
+        .filter(Files.isRegularFile(_))
+        .filter(_.getFileName.toString.endsWith(".orc"))
+        .map(p => p.getFileName.toString ->
+                  spark.read.orc(p.toUri.toString).collect()(0).getString(0))
+        .toMap
+    finally s.close()
+  }
+
   // ------------------------------------------------------------------
   // The tests
   // ------------------------------------------------------------------
@@ -298,6 +349,75 @@ object CellTests {
       assertTrue("mismatched nested dir must be left untouched",
                  Files.exists(wrapper.resolve("runid=eee5")))
     }
+
+    // The merge path is where data can actually be lost: files are moved into a
+    // directory that already holds files, and HDFS rename onto an existing name
+    // fails. The cell renames the incoming file instead. If that ever regresses,
+    // a partition silently loses a file -- so assert on contents, not counts.
+    check("a name collision on merge keeps both files") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val root = newRoot("flatten-collide")
+      // already-correct partition, and a nested leftover for the SAME run whose
+      // file carries the SAME name -- the state a half-finished rename leaves
+      writeNamedOrc(root.resolve("runId=ggg7"), "part-0.orc", "from-target")
+      writeNamedOrc(root.resolve("runid=ggg7").resolve("runid=ggg7"),
+                    "part-0.orc", "from-nested")
+      createTable(DB, "flat_collide", root)
+      addPartition(DB, "flat_collide", "ggg7", uri(root) + "/runid=ggg7/runid=ggg7")
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_collide",
+        "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-collide.sql")))
+
+      val body = orcTags(root.resolve("runId=ggg7"))
+      assertEquals("both files must land in runId=ggg7, got " + body.keys.toSeq.sorted,
+                   2, body.size)
+      assertTrue("the file already there must keep its name and content",
+                 body.get("part-0.orc").contains("from-target"))
+      assertTrue("the incoming file must survive under a merged_ name, got " +
+                 body.keys.toSeq.sorted,
+                 body.exists { case (n, c) =>
+                   n.startsWith("merged_") && n.endsWith("_part-0.orc") &&
+                   c == "from-nested" })
+      assertFalse("the emptied wrapper must be gone",
+                  Files.exists(root.resolve("runid=ggg7")))
+      assertTrue("the metastore must point at the flattened dir",
+                 partitionLocations(DB, "flat_collide")("ggg7").endsWith("runId=ggg7"))
+    }
+
+    // _SUCCESS and friends are never moved: they describe the write that made
+    // the directory, and moving them would relabel a different directory. The
+    // cell keeps them, and therefore must NOT delete the dir they sit in.
+    check("markers stay put and their dir survives the merge") {
+      val root = newRoot("flatten-markers")
+      val inner = root.resolve("runId=hhh8").resolve("runid=hhh8")
+      writeNamedOrc(inner, "part-0.orc", "data")
+      writeMarker(inner, "_SUCCESS")
+      createTable(DB, "flat_mark", root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_mark",
+        "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-mark.sql")))
+      assertTrue("the data file must be promoted",
+                 Files.exists(root.resolve("runId=hhh8").resolve("part-0.orc")))
+      assertTrue("the marker must be left where it was",
+                 Files.exists(inner.resolve("_SUCCESS")))
+      assertFalse("the marker must not have been promoted too",
+                  Files.exists(root.resolve("runId=hhh8").resolve("_SUCCESS")))
+    }
+
+    check("DELETE_MARKERS_ON_MERGE=true clears the nested dir") {
+      val root = newRoot("flatten-markers-del")
+      val inner = root.resolve("runId=iii9").resolve("runid=iii9")
+      writeNamedOrc(inner, "part-0.orc", "data")
+      writeMarker(inner, "_SUCCESS")
+      createTable(DB, "flat_mark_del", root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_mark_del",
+        "DRY_RUN" -> "false", "DELETE_MARKERS_ON_MERGE" -> "true",
+        "DDL_OUTPUT_PATH" -> ddl(root, "ddl-mark-del.sql")))
+      assertTrue("the data file must still be promoted",
+                 Files.exists(root.resolve("runId=iii9").resolve("part-0.orc")))
+      assertFalse("the emptied nested dir must be gone", Files.exists(inner))
+    }
   }
 
   private def renameTests(): Unit = {
@@ -329,6 +449,55 @@ object CellTests {
         "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-rn.sql")))
       assertTrue("still-nested dir must be left alone",
                  Files.exists(outer.resolve("runid=fff6")))
+    }
+
+    // MERGE_ON_COLLISION is the guard between "tidy the casing" and "move data
+    // between two directories". With it off the cell must report and stop, so
+    // that a partly-renamed table can be inspected before anything moves.
+    check("MERGE_ON_COLLISION=false refuses a colliding target") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val root = newRoot("rename-nomerge")
+      writeNamedOrc(root.resolve("runId=jjj1"), "part-0.orc", "from-target")
+      writeNamedOrc(root.resolve("runid=jjj1"), "part-1.orc", "from-source")
+      createTable(DB, "ren_nomerge", root)
+      val before = tree(root)
+      generated.RenameCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.ren_nomerge",
+        "DRY_RUN" -> "false", "MERGE_ON_COLLISION" -> "false",
+        "DDL_OUTPUT_PATH" -> ddl(root, "ddl-nomerge.sql")))
+      assertEquals("nothing may move when merging is refused", before, tree(root))
+    }
+
+    check("MERGE_ON_COLLISION=true loses no file, colliding or not") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val root = newRoot("rename-merge")
+      writeNamedOrc(root.resolve("runId=kkk2"), "part-0.orc", "from-target")
+      writeNamedOrc(root.resolve("runid=kkk2"), "part-0.orc", "from-source")
+      writeNamedOrc(root.resolve("runid=kkk2"), "part-9.orc", "only-in-source")
+      createTable(DB, "ren_merge", root)
+      addPartition(DB, "ren_merge", "kkk2", uri(root) + "/runid=kkk2")
+      generated.RenameCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.ren_merge",
+        "DRY_RUN" -> "false", "MERGE_ON_COLLISION" -> "true",
+        "DDL_OUTPUT_PATH" -> ddl(root, "ddl-merge.sql")))
+
+      val body = orcTags(root.resolve("runId=kkk2"))
+      assertEquals("all three files must end up in runId=kkk2, got " +
+                   body.keys.toSeq.sorted, 3, body.size)
+      assertTrue("the file already there must be untouched",
+                 body.get("part-0.orc").contains("from-target"))
+      assertTrue("the non-colliding file must move under its own name",
+                 body.get("part-9.orc").contains("only-in-source"))
+      assertTrue("the colliding file must survive renamed, got " +
+                 body.keys.toSeq.sorted,
+                 body.exists { case (n, c) =>
+                   n.startsWith("merged_") && c == "from-source" })
+      assertFalse("the emptied source dir must be gone",
+                  Files.exists(root.resolve("runid=kkk2")))
+      assertTrue("the metastore must be re-pointed",
+                 partitionLocations(DB, "ren_merge")("kkk2").endsWith("runId=kkk2"))
+      assertEquals("and all three rows must read back through the table", 3L,
+                   spark.table(s"$DB.ren_merge").count())
     }
   }
 
@@ -422,6 +591,55 @@ object CellTests {
                  msg.contains("not visible to this Spark session"))
       assertTrue("must carry the catalog diagnostics, got: " + msg,
                  msg.contains("catalogImplementation"))
+    }
+
+    // recreate mode DROPs before it CREATEs. The backup file is the only way
+    // back if the CREATE fails, so it has to be readable and complete BEFORE
+    // the drop -- an empty or partial one is worse than none, because it looks
+    // like a safety net.
+    check("the backup replays the pre-drop definition") {
+      val root = newRoot("recreate-backup")
+      writeOrcPartition(root, "runId", "aaa1", 1)
+      writeOrcPartition(root, "runId", "bbb2", 1)
+      writeOrcPartition(root, "runId", "ccc3", 1)
+      createTable(DB, "rec_backup", root)
+      Seq("aaa1", "bbb2", "ccc3").foreach(v =>
+        addPartition(DB, "rec_backup", v, uri(root) + s"/runId=$v"))
+      val backupPath = ddl(root, "rec-backup-backup.sql")
+      generated.RecreateCell.run(spark, Map(
+        "HIVE_TABLE" -> s"$DB.rec_backup", "TABLE_ROOT" -> uri(root),
+        "DRY_RUN" -> "false", "FIX_MODE" -> "recreate",
+        "DDL_OUTPUT_PATH" -> ddl(root, "rec-backup.sql"),
+        "BACKUP_OUTPUT_PATH" -> backupPath))
+
+      val backup = new String(Files.readAllBytes(
+        new File(new java.net.URI(backupPath)).toPath), "UTF-8")
+      assertTrue("the backup must carry the original CREATE, got: " + backup.take(300),
+                 backup.contains("CREATE") && backup.contains("rec_backup"))
+      Seq("aaa1", "bbb2", "ccc3").foreach { v =>
+        assertTrue(s"the backup must be able to re-add partition $v, got: " + backup,
+                   backup.contains(s"ADD IF NOT EXISTS PARTITION") && backup.contains(v))
+      }
+    }
+
+    // One partition proves the re-registration runs at all; three prove it
+    // does not stop after the first. A partial replay leaves data on disk that
+    // the table can no longer see.
+    check("recreate re-registers every partition, not just one") {
+      val root = newRoot("recreate-many")
+      Seq("aaa1", "bbb2", "ccc3").foreach(v => writeOrcPartition(root, "runId", v, 1))
+      createTable(DB, "rec_many", root)
+      Seq("aaa1", "bbb2", "ccc3").foreach(v =>
+        addPartition(DB, "rec_many", v, uri(root) + s"/runId=$v"))
+      generated.RecreateCell.run(spark, Map(
+        "HIVE_TABLE" -> s"$DB.rec_many", "TABLE_ROOT" -> uri(root),
+        "DRY_RUN" -> "false", "FIX_MODE" -> "recreate",
+        "DDL_OUTPUT_PATH" -> ddl(root, "rec-many.sql"),
+        "BACKUP_OUTPUT_PATH" -> ddl(root, "rec-many-backup.sql")))
+      assertEquals("every partition must come back", 3L,
+                   spark.sql(s"SHOW PARTITIONS $DB.rec_many").count())
+      assertEquals("and the rows must still be readable through the table", 3L,
+                   spark.table(s"$DB.rec_many").count())
     }
   }
 
