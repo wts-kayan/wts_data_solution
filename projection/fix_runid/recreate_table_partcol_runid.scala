@@ -19,21 +19,57 @@
 //  ----
 //  Guarantee the table carries
 //      'spark.sql.sources.schema.numPartCols' = '1'
-//      'spark.sql.sources.schema.partCol.0'   = 'runid'
-//  and that the schema JSON in 'spark.sql.sources.schema' lists `runid` as
-//  the partition column, so Spark and Hive agree on a single lowercase
-//  partition column.
+//      'spark.sql.sources.schema.partCol.0'   = 'runId'
+//  and that the field for the partition column inside the
+//  'spark.sql.sources.schema' JSON is named `runId` too, so that Spark's view
+//  of the table uses the camelCase name -- including when it creates
+//  partition directories.
+//
+//  WHAT CANNOT BE CHANGED (and why the two cases coexist)
+//  -----------------------------------------------------
+//  The Hive metastore LOWERCASES every column name. There is no DDL that
+//  makes it store `runId`:
+//      SHOW CREATE TABLE  -> PARTITIONED BY (runid string)     always
+//      SHOW PARTITIONS    -> runid=<uuid>                       always
+//  So the Hive column stays `runid` and only Spark's schema properties carry
+//  `runId`. That is not a defect, it is how Spark preserves column case on
+//  Hive -- the same mechanism already keeps the camelCase data columns
+//  (matrixMigrationName, asOfDate, notationCode) readable.
+//
+//  Consequence, and the reason this matters: Spark names the partition
+//  DIRECTORIES after its own schema, so once partCol.0 is `runId` a Spark
+//  write produces runId=<uuid>/ rather than runid=<uuid>/.
+//
+//  The script therefore RENAMES the partition field inside the schema JSON to
+//  PARTITION_COL. Data columns are never re-cased.
+//
+//  SPARK WILL NOT LET YOU SET THESE PROPERTIES BY HAND
+//  ---------------------------------------------------
+//  This is the constraint that decides which mode is usable:
+//
+//      AnalysisException: Cannot persist <table> into Hive metastore as table
+//      property keys may not start with 'spark.sql.'
+//
+//  Spark rejects ANY user-issued SET TBLPROPERTIES / CREATE ... TBLPROPERTIES
+//  whose key starts with "spark.sql.". So the schema properties can only be
+//  written in one of two ways:
+//    * let SPARK write them, by creating a DATASOURCE table (USING ORC +
+//      PARTITIONED BY) whose column list already carries the casing. Spark
+//      then persists spark.sql.sources.schema / numPartCols / partCol.0 for
+//      you, taking the names verbatim from the DDL. This is FIX_MODE
+//      "recreate", and it is the only mode that works from Spark;
+//    * replay the ALTER through HIVE / beeline, which has no such guard.
 //
 //  TWO MODES -- read this before choosing
 //  --------------------------------------
-//  FIX_MODE = "alter"     (SAFE, recommended, no drop)
-//      Rewrites only the TBLPROPERTIES in place:
+//  FIX_MODE = "alter"     (cannot be executed from Spark -- emits DDL only)
+//      Generates
 //          ALTER TABLE ... SET TBLPROPERTIES (...)
-//      Partitions, data and locations are untouched: nothing to re-register,
-//      nothing to lose. Use this whenever partCol.0 is the only problem.
+//      and REFUSES to run it, because Spark rejects it (see above). Use this
+//      to get a .sql file you replay through beeline. It touches nothing:
+//      no drop, no partition re-registration.
 //
-//  FIX_MODE = "recreate"  (DROP + CREATE, use only when the table
-//                          definition itself is wrong)
+//  FIX_MODE = "recreate"  (DROP + CREATE, the mode that works from Spark)
 //      Captures the schema, the location and EVERY partition location, drops
 //      the table definition, recreates it, then re-adds each partition.
 //      The data is NOT touched because the table is EXTERNAL -- but the
@@ -435,21 +471,34 @@ val schemaProps = Seq(("spark.sql.sources.schema", schemaJson),
 
 val statements = ArrayBuffer[String]()
 
+// Spark REFUSES to persist any table property whose key starts with
+// "spark.sql." :
+//   AnalysisException: Cannot persist <table> into Hive metastore as table
+//   property keys may not start with 'spark.sql.'
+// so spark.sql.sources.schema* can never be written by an explicit
+// SET TBLPROPERTIES / CREATE ... TBLPROPERTIES issued from Spark. There are
+// exactly two ways to get the wanted casing in there:
+//   * let Spark write the properties ITSELF, by creating a DATASOURCE table
+//     (USING ORC + PARTITIONED BY) whose column list already carries the
+//     casing -- that is what "recreate" does below;
+//   * replay an ALTER TABLE through Hive/beeline, which has no such guard --
+//     that is what "alter" emits, without executing it.
+val st         = DataType.fromJson(schemaJson).asInstanceOf[StructType]
+val dataFields = st.fields.filter(_.name.toLowerCase != HIVE_PARTITION_COL)
+
 if (FIX_MODE == "alter") {
   statements += s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES (\n${propsBlock(schemaProps)}\n);"
 } else {
-  val colsDdl = dataCols.map { case (n, t) => s"  `$n` $t" }.mkString(",\n")
+  val colsDdl = dataFields.map(f => s"  `${f.name}` ${f.dataType.sql}").mkString(",\n")
   statements += s"DROP TABLE IF EXISTS $HIVE_TABLE;"
+  // A datasource table: LOCATION makes it EXTERNAL, and Spark persists
+  // spark.sql.sources.schema / numPartCols / partCol.0 itself, taking the
+  // column names verbatim from this DDL -- casing included.
   statements +=
-    s"CREATE EXTERNAL TABLE $HIVE_TABLE (\n$colsDdl\n)\n" +
-    s"PARTITIONED BY (\n  `$PARTITION_COL` $PARTITION_TYPE)\n" +
-    "ROW FORMAT SERDE\n  'org.apache.hadoop.hive.ql.io.orc.OrcSerde'\n" +
-    "STORED AS INPUTFORMAT\n  'org.apache.hadoop.hive.ql.io.orc.OrcInputFormat'\n" +
-    "OUTPUTFORMAT\n  'org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat'\n" +
-    s"LOCATION\n  '$location'\n" +
-    s"TBLPROPERTIES (\n${propsBlock(preserved.toSeq)}\n);"
-  // CREATE may normalise the schema properties away; re-assert them.
-  statements += s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES (\n${propsBlock(schemaProps)}\n);"
+    s"CREATE TABLE $HIVE_TABLE (\n$colsDdl,\n  `$PARTITION_COL` $PARTITION_TYPE\n)\n" +
+    s"USING ORC\n" +
+    s"PARTITIONED BY (`$PARTITION_COL`)\n" +
+    s"LOCATION '$location';"
   partitions.foreach { case (value, loc) =>
     statements += s"ALTER TABLE $HIVE_TABLE ADD IF NOT EXISTS PARTITION " +
                   s"($HIVE_PARTITION_COL='$value') LOCATION '$loc';"
@@ -492,6 +541,11 @@ writeText(DDL_OUTPUT_PATH, ddlText)
 if (DRY_RUN) {
   log("INFO", s"DRY_RUN=true -> nothing executed. Review $DDL_OUTPUT_PATH and " +
               BACKUP_OUTPUT_PATH + ".")
+} else if (FIX_MODE == "alter") {
+  log("ERROR", "FIX_MODE='alter' cannot be executed from Spark: it refuses table " +
+               "property keys starting with 'spark.sql.'.")
+  log("ERROR", s"Replay $DDL_OUTPUT_PATH through Hive/beeline instead, which has no " +
+               "such guard, or use FIX_MODE='recreate'.")
 } else if (FIX_MODE == "recreate" && !backupOk) {
   sys.error(s"ABORT: the backup file could not be written to $BACKUP_OUTPUT_PATH. " +
             "Refusing to DROP the table without a replayable backup. Nothing was modified.")

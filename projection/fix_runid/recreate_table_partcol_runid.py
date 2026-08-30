@@ -38,16 +38,33 @@
 #  The script therefore RENAMES the partition field inside the schema JSON to
 #  PARTITION_COL. Data columns are never re-cased.
 #
+#  SPARK WILL NOT LET YOU SET THESE PROPERTIES BY HAND
+#  ---------------------------------------------------
+#  This is the constraint that decides which mode is usable:
+#
+#      AnalysisException: Cannot persist <table> into Hive metastore as table
+#      property keys may not start with 'spark.sql.'
+#
+#  Spark rejects ANY user-issued SET TBLPROPERTIES / CREATE ... TBLPROPERTIES
+#  whose key starts with "spark.sql.". So the schema properties can only be
+#  written in one of two ways:
+#    * let SPARK write them, by creating a DATASOURCE table (USING ORC +
+#      PARTITIONED BY) whose column list already carries the casing. Spark
+#      then persists spark.sql.sources.schema / numPartCols / partCol.0 for
+#      you, taking the names verbatim from the DDL. This is FIX_MODE
+#      "recreate", and it is the only mode that works from Spark;
+#    * replay the ALTER through HIVE / beeline, which has no such guard.
+#
 #  TWO MODES -- read this before choosing
 #  --------------------------------------
-#  FIX_MODE = "alter"     (SAFE, recommended, no drop)
-#      Rewrites only the TBLPROPERTIES in place:
+#  FIX_MODE = "alter"     (cannot be executed from Spark -- emits DDL only)
+#      Generates
 #          ALTER TABLE ... SET TBLPROPERTIES (...)
-#      Partitions, data and locations are untouched: nothing to re-register,
-#      nothing to lose. Use this whenever partCol.0 is the only problem.
+#      and REFUSES to run it, because Spark rejects it (see above). Use this
+#      to get a .sql file you replay through beeline. It touches nothing:
+#      no drop, no partition re-registration.
 #
-#  FIX_MODE = "recreate"  (DROP + CREATE, use only when the table
-#                          definition itself is wrong)
+#  FIX_MODE = "recreate"  (DROP + CREATE, the mode that works from Spark)
 #      Captures the schema, the location and EVERY partition location, drops
 #      the table definition, recreates it, then re-adds each partition.
 #      The data is NOT touched because the table is EXTERNAL -- but the
@@ -476,33 +493,44 @@ def props_block(d, indent="  "):
 
 statements = []
 
+# Spark REFUSES to persist any table property whose key starts with
+# "spark.sql." :
+#   AnalysisException: Cannot persist <table> into Hive metastore as table
+#   property keys may not start with 'spark.sql.'
+# so spark.sql.sources.schema* can never be written by an explicit
+# SET TBLPROPERTIES / CREATE ... TBLPROPERTIES issued from Spark. There are
+# exactly two ways to get the wanted casing in there:
+#   * let Spark write the properties ITSELF, by creating a DATASOURCE table
+#     (USING ORC + PARTITIONED BY) whose column list already carries the
+#     casing -- that is what "recreate" does below;
+#   * replay an ALTER TABLE through Hive/beeline, which has no such guard --
+#     that is what "alter" emits, without executing it.
+from pyspark.sql.types import StructType
+
+_st = StructType.fromJson(json.loads(schema_json))
+data_fields = [f for f in _st.fields if f.name.lower() != HIVE_PARTITION_COL]
+
+schema_props = {"spark.sql.sources.schema": schema_json,
+                "spark.sql.sources.schema.numPartCols": "1",
+                "spark.sql.sources.schema.partCol.0": PARTITION_COL}
+
 if FIX_MODE == "alter":
-    statements.append(
-        "ALTER TABLE %s SET TBLPROPERTIES (\n%s\n);"
-        % (HIVE_TABLE,
-           props_block({"spark.sql.sources.schema": schema_json,
-                        "spark.sql.sources.schema.numPartCols": "1",
-                        "spark.sql.sources.schema.partCol.0": PARTITION_COL})))
+    statements.append("ALTER TABLE %s SET TBLPROPERTIES (\n%s\n);"
+                      % (HIVE_TABLE, props_block(schema_props)))
 else:
-    cols_ddl = ",\n".join("  `%s` %s" % (n, t) for n, t in data_cols)
+    cols_ddl = ",\n".join("  `%s` %s" % (f.name, f.dataType.simpleString())
+                          for f in data_fields)
     statements.append("DROP TABLE IF EXISTS %s;" % HIVE_TABLE)
+    # A datasource table: LOCATION makes it EXTERNAL, and Spark persists
+    # spark.sql.sources.schema / numPartCols / partCol.0 itself, taking the
+    # column names verbatim from this DDL -- casing included.
     statements.append(
-        "CREATE EXTERNAL TABLE %s (\n%s\n)\n"
-        "PARTITIONED BY (\n  `%s` %s)\n"
-        "ROW FORMAT SERDE\n  'org.apache.hadoop.hive.ql.io.orc.OrcSerde'\n"
-        "STORED AS INPUTFORMAT\n  'org.apache.hadoop.hive.ql.io.orc.OrcInputFormat'\n"
-        "OUTPUTFORMAT\n  'org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat'\n"
-        "LOCATION\n  '%s'\n"
-        "TBLPROPERTIES (\n%s\n);"
-        % (HIVE_TABLE, cols_ddl, PARTITION_COL, PARTITION_TYPE, location,
-           props_block(preserved)))
-    # CREATE may normalise the schema properties away; re-assert them.
-    statements.append(
-        "ALTER TABLE %s SET TBLPROPERTIES (\n%s\n);"
-        % (HIVE_TABLE,
-           props_block({"spark.sql.sources.schema": schema_json,
-                        "spark.sql.sources.schema.numPartCols": "1",
-                        "spark.sql.sources.schema.partCol.0": PARTITION_COL})))
+        "CREATE TABLE %s (\n%s,\n  `%s` %s\n)\n"
+        "USING ORC\n"
+        "PARTITIONED BY (`%s`)\n"
+        "LOCATION '%s';"
+        % (HIVE_TABLE, cols_ddl, PARTITION_COL, PARTITION_TYPE,
+           PARTITION_COL, location))
     for value, loc in partitions:
         statements.append(
             "ALTER TABLE %s ADD IF NOT EXISTS PARTITION (%s='%s') LOCATION '%s';"
@@ -543,6 +571,11 @@ write_text(DDL_OUTPUT_PATH, ddl_text)
 if DRY_RUN:
     log("INFO", "DRY_RUN=True -> nothing executed. Review %s and %s."
                 % (DDL_OUTPUT_PATH, BACKUP_OUTPUT_PATH))
+elif FIX_MODE == "alter":
+    log("ERROR", "FIX_MODE='alter' cannot be executed from Spark: it refuses table "
+                 "property keys starting with 'spark.sql.'.")
+    log("ERROR", "Replay %s through Hive/beeline instead (no such guard there), or "
+                 "use FIX_MODE='recreate'." % DDL_OUTPUT_PATH)
 elif FIX_MODE == "recreate" and not backup_ok:
     raise RuntimeError(
         "ABORT: the backup file could not be written to %s. Refusing to DROP the table "

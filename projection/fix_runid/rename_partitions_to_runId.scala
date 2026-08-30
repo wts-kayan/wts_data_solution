@@ -135,10 +135,17 @@ def splitKey(name: String): (String, Option[String]) = {
 def pathOnly(uri: String): String = {
   val u = uri.stripSuffix("/")
   val i = u.indexOf("://")
-  if (i < 0) u
-  else {
+  if (i >= 0) {
     val j = u.indexOf("/", i + 3)
     if (j >= 0) u.substring(j) else "/"
+  } else {
+    // scheme:/path -- a URI with a scheme but NO authority, which is what
+    // Hive reports for e.g. file:/a/b. Without this branch such a location is
+    // never recognised as living under a root written file:///a.
+    val c = u.indexOf(":/")
+    // the scheme must be longer than one char so a Windows drive letter
+    // (C:/...) is not mistaken for a URI scheme
+    if (c > 1 && !u.substring(0, c).contains("/")) u.substring(c + 1) else u
   }
 }
 

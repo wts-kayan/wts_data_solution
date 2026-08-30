@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Offline compile + test harness for the notebook-cell Scala scripts in
+  projection/fix_runid.
+
+  Every version below was chosen because it is ALREADY in the local ~/.m2
+  repository, so `mvn -o` (offline) works with no network access. Spark 3.5.4
+  and Scala 2.12.18 are also what the CDP 7.1.9 cluster runs, so a compile
+  here is a faithful compile check for the notebook.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.bnp.projection</groupId>
+  <artifactId>fix-runid-scala-test</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+  <name>fix_runid Scala cell compile+test harness</name>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <scala.version>2.12.18</scala.version>
+    <scala.compat.version>2.12</scala.compat.version>
+    <spark.version>3.5.4</spark.version>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+      <version>${scala.version}</version>
+    </dependency>
+
+    <!-- compile scope, not provided: the tests actually run a local Spark -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.compat.version}</artifactId>
+      <version>${spark.version}</version>
+    </dependency>
+    <!-- brings the Hive metastore the cells talk to (SHOW PARTITIONS,
+         DESCRIBE FORMATTED, ALTER TABLE ... ADD PARTITION) -->
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-hive_${scala.compat.version}</artifactId>
+      <version>${spark.version}</version>
+    </dependency>
+
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/scala</sourceDirectory>
+    <plugins>
+
+      <!-- Maven 3.9 defaults to plugin versions that are NOT in the local
+           repository, which breaks `mvn -o`. Pin every lifecycle plugin to a
+           version that is already cached. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-resources-plugin</artifactId>
+        <version>3.3.1</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-install-plugin</artifactId>
+        <version>3.1.2</version>
+      </plugin>
+      <!-- Surefire is skipped entirely: its provider jars are not cached, and
+           the cell tests run through exec:exec below instead. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.4</version>
+        <configuration>
+          <skip>true</skip>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+        <version>4.9.5</version>
+        <executions>
+          <execution>
+            <id>scala-compile</id>
+            <goals>
+              <goal>compile</goal>
+            </goals>
+          </execution>
+        </executions>
+        <configuration>
+          <scalaVersion>${scala.version}</scalaVersion>
+          <args>
+            <arg>-deprecation</arg>
+            <arg>-feature</arg>
+          </args>
+          <jvmArgs>
+            <jvmArg>-Xms256m</jvmArg>
+            <jvmArg>-Xmx1024m</jvmArg>
+          </jvmArgs>
+        </configuration>
+      </plugin>
+
+      <!-- The tests run as a plain main() through exec:exec, not surefire:
+           the surefire JUnit provider jar is not in the local ~/.m2, and this
+           harness must work fully offline. exec:exec also forks a real JVM, so
+           the "add-opens" flags Spark needs on Java 11+ actually take effect. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.6.3</version>
+        <executions>
+          <execution>
+            <id>run-cell-tests</id>
+            <phase>test</phase>
+            <goals><goal>exec</goal></goals>
+          </execution>
+        </executions>
+        <configuration>
+          <executable>java</executable>
+          <arguments>
+            <argument>-Xmx2g</argument>
+            <argument>-Dfile.encoding=UTF-8</argument>
+            <argument>--add-opens=java.base/java.lang=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/java.lang.invoke=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/java.lang.reflect=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/java.io=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/java.net=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/java.nio=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/java.util=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/java.util.concurrent=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/sun.nio.ch=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/sun.nio.cs=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/sun.security.action=ALL-UNNAMED</argument>
+            <argument>--add-opens=java.base/sun.util.calendar=ALL-UNNAMED</argument>
+            <argument>-classpath</argument>
+            <classpath/>
+            <argument>com.bnp.runid.CellTests</argument>
+          </arguments>
+        </configuration>
+      </plugin>
+
+    </plugins>
+  </build>
+</project>

@@ -217,12 +217,24 @@ def split_key(name):
 
 
 def path_only(uri):
+    """Strip scheme and authority so two locations can be compared.
+
+    Handles both URI shapes Hive hands back:
+        hdfs://nameservice/a/b   (scheme + authority)
+        file:/a/b                (scheme, NO authority)
+    Without the second case a location the metastore reports as file:/x is
+    never recognised as living under a table root written file:///x."""
     uri = str(uri).rstrip("/")
     i = uri.find("://")
-    if i < 0:
-        return uri
-    j = uri.find("/", i + 3)
-    return uri[j:] if j >= 0 else "/"
+    if i >= 0:
+        j = uri.find("/", i + 3)
+        return uri[j:] if j >= 0 else "/"
+    c = uri.find(":/")
+    # the scheme must be longer than one char, so a Windows drive letter
+    # (C:/...) is not mistaken for a URI scheme
+    if c > 1 and "/" not in uri[:c]:
+        return uri[c + 1:]
+    return uri
 
 
 ROOT_PATH_ONLY = path_only(TABLE_ROOT)
