@@ -18,10 +18,13 @@ import org.apache.spark.sql.SparkSession
   *
   * The local filesystem stands in for HDFS. That is faithful for what the
   * cells do -- they only ever go through the Hadoop FileSystem API, the same
-  * code path for file:// and hdfs://. Case sensitivity is the one thing it
-  * does not reproduce on Windows/macOS, where `runId=x` and `runid=x` collapse
-  * into one directory. Tests that need both casings to coexist are SKIPPED
-  * there rather than asserting something false -- see `caseSensitiveFs`.
+  * code path for file:// and hdfs://.
+  *
+  * Case sensitivity matters here, because the whole point is telling runId=
+  * from runid=. NTFS supports it per directory, so the temp roots turn it on
+  * (see `enableCaseSensitivity`) and the case-mixing tests run on Windows too.
+  * If that ever fails, `caseSensitiveFs` reports false and those tests SKIP
+  * rather than assert something false.
   *
   * Plain `main` rather than JUnit on purpose: the surefire JUnit provider is
   * not in the local ~/.m2, and this harness must run fully offline.
@@ -38,10 +41,11 @@ object CellTests {
 
   private var nativeSkips = 0
 
-  /** Hadoop's local FileSystem calls NativeIO.POSIX.stat for permission info.
-    * On Windows without winutils.exe / hadoop.dll that link fails. It is an
-    * environment limitation, not a defect in the cell under test, so those
-    * runs are reported as SKIP -- never silently as PASS. */
+  /** Hadoop's local FileSystem reaches for NativeIO.POSIX.stat, a symbol the
+    * Windows hadoop.dll does not export. The session config avoids every path
+    * that needs it, but if a new one appears it is an environment limitation
+    * rather than a defect in the cell, so it is reported as SKIP -- never
+    * silently as PASS. */
   private def isMissingHadoopNative(t: Throwable): Boolean = {
     var c = t
     while (c != null) {
@@ -115,6 +119,11 @@ object CellTests {
       // the pure-Java fallback keeps the local filesystem usable. Irrelevant on
       // Linux and on the cluster, where the native path works.
       .config("spark.hadoop.io.native.lib.available", "false")
+      // Hive inherits permissions onto a directory it creates in the warehouse
+      // via HdfsUtils.setFullFileStatus -> getGroup() -> NativeIO$POSIX.stat,
+      // a symbol the Windows hadoop.dll does not export. Turning the
+      // inheritance off skips that call entirely. No effect on Linux.
+      .config("spark.hadoop.hive.warehouse.subdir.inherit.perms", "false")
       .enableHiveSupport()
       .getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
@@ -133,10 +142,23 @@ object CellTests {
     finally s.close()
   }
 
-  /** Does this filesystem distinguish runId= from runid=? HDFS does; Windows
-    * and default macOS do not, so case-mixing tests must be skipped there. */
+  /** NTFS supports case sensitivity per directory. Turning it on lets runId=
+    * and runid= coexist the way they do on HDFS, so the case-mixing tests can
+    * run on Windows too. Child directories inherit the flag. No-op elsewhere. */
+  private def enableCaseSensitivity(dir: JPath): Unit =
+    if (System.getProperty("os.name", "").toLowerCase.contains("win")) {
+      try {
+        val p = new ProcessBuilder("fsutil", "file", "setCaseSensitiveInfo",
+                                   dir.toString, "enable")
+          .redirectErrorStream(true).start()
+        p.getInputStream.close()
+        p.waitFor()
+      } catch { case _: Throwable => () }   // best effort; probe decides
+    }
+
   private lazy val caseSensitiveFs: Boolean = {
     val probe = Files.createTempDirectory("casetest-")
+    enableCaseSensitivity(probe)
     Files.createDirectory(probe.resolve("runId=probe"))
     !Files.exists(probe.resolve("runid=probe"))
   }
@@ -198,7 +220,11 @@ object CellTests {
     spark.sql(s"SHOW TBLPROPERTIES $t").collect()
       .map(r => r.getString(0) -> r.getString(1)).toMap
 
-  private def newRoot(name: String): JPath = Files.createTempDirectory(s"fixrunid-$name-")
+  private def newRoot(name: String): JPath = {
+    val p = Files.createTempDirectory(s"fixrunid-$name-")
+    enableCaseSensitivity(p)
+    p
+  }
 
   private def ddl(root: JPath, n: String) = uri(root.getParent.resolve(n))
 
