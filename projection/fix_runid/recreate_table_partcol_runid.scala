@@ -72,12 +72,19 @@ val DRY_RUN = true                // must stay true until the DDL is reviewed
 
 val FIX_MODE = "recreate"         // "alter" (safe, in place) | "recreate" (drop + create)
 
-val PARTITION_COL  = "runid"      // the canonical lowercase partition column
+// The partition column AS SPARK SEES IT -- the case written into
+// spark.sql.sources.schema.partCol.0 and into the schema JSON field name.
+// NOTE: the HIVE column is ALWAYS lowercase; the metastore lowercases every
+// column name, so SHOW CREATE TABLE keeps showing PARTITIONED BY (runid
+// string) and SHOW PARTITIONS keeps returning runid=<uuid> whatever you put
+// here. Only Spark's own view of the table can carry the camelCase.
+val PARTITION_COL  = "runId"
 val PARTITION_TYPE = "string"
+val HIVE_PARTITION_COL = PARTITION_COL.toLowerCase   // what the metastore stores
 
 // Directory key used by the partition LOCATIONs when they have to be rebuilt.
 // Set to "runId" if you ran rename_partitions_to_runId.scala, "runid" otherwise.
-val ON_DISK_KEY = "runid"
+val ON_DISK_KEY = "runId"
 
 val DDL_OUTPUT_PATH =
   "/Projects/STCreditRisk_UAT/tmp/recreate_table_ddl.sql"
@@ -244,7 +251,7 @@ Seq("Table Type", "Type").find(detail.contains).foreach { k =>
 location = detail.getOrElse("Location", null)
 
 // The partition column is also listed among the data columns; drop it there.
-val partNames = if (partColsBuf.isEmpty) Set(PARTITION_COL)
+val partNames = if (partColsBuf.isEmpty) Set(HIVE_PARTITION_COL)
                 else partColsBuf.map(_._1.toLowerCase).toSet
 val dataCols  = dataColsBuf.filterNot { case (n, _) => partNames.contains(n.toLowerCase) }.toSeq
 
@@ -385,11 +392,20 @@ var schemaNames = Seq[String]()
 Try {
   val st = DataType.fromJson(schemaJson).asInstanceOf[StructType]
   schemaNames = st.fieldNames.toSeq
-  if (!schemaNames.map(_.toLowerCase).contains(PARTITION_COL)) {
+  val hit = schemaNames.indexWhere(_.toLowerCase == HIVE_PARTITION_COL)
+  if (hit < 0) {
     val st2 = StructType(st.fields :+ StructField(PARTITION_COL, StringType, nullable = true))
     schemaJson  = st2.json
     schemaNames = st2.fieldNames.toSeq
     log("WARN", s"partition column '$PARTITION_COL' was missing from the schema JSON - appended")
+  } else if (schemaNames(hit) != PARTITION_COL) {
+    // This rename is the whole point: Hive cannot store the camelCase, so the
+    // schema JSON is the only place the wanted case can live.
+    val was = schemaNames(hit)
+    val st2 = StructType(st.fields.updated(hit, st.fields(hit).copy(name = PARTITION_COL)))
+    schemaJson  = st2.json
+    schemaNames = st2.fieldNames.toSeq
+    log("INFO", s"partition column re-cased in the schema JSON: '$was' -> '$PARTITION_COL'")
   }
 }.failed.foreach(e => log("WARN", s"could not re-parse the schema JSON: ${e.getMessage}"))
 
@@ -438,7 +454,7 @@ if (FIX_MODE == "alter") {
   statements += s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES (\n${propsBlock(schemaProps)}\n);"
   partitions.foreach { case (value, loc) =>
     statements += s"ALTER TABLE $HIVE_TABLE ADD IF NOT EXISTS PARTITION " +
-                  s"($PARTITION_COL='$value') LOCATION '$loc';"
+                  s"($HIVE_PARTITION_COL='$value') LOCATION '$loc';"
   }
 }
 
@@ -462,7 +478,7 @@ val backupProps = if (tblprops.isEmpty) "-- (none)"
 val backupParts = if (partitions.isEmpty) "-- (none)"
                   else partitions.map { case (v, l) =>
                     s"ALTER TABLE $HIVE_TABLE ADD IF NOT EXISTS PARTITION " +
-                    s"($PARTITION_COL='$v') LOCATION '$l';" }.mkString("\n")
+                    s"($HIVE_PARTITION_COL='$v') LOCATION '$l';" }.mkString("\n")
 
 val backupText =
   s"-- BACKUP of $HIVE_TABLE taken on ${LocalDateTime.now()}\n" +

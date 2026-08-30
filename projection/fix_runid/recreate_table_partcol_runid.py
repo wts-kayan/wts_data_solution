@@ -12,10 +12,31 @@
 #  ----
 #  Guarantee the table carries
 #      'spark.sql.sources.schema.numPartCols' = '1'
-#      'spark.sql.sources.schema.partCol.0'   = 'runid'
-#  and that the schema JSON in 'spark.sql.sources.schema' lists `runid` as
-#  the partition column, so Spark and Hive agree on a single lowercase
-#  partition column.
+#      'spark.sql.sources.schema.partCol.0'   = 'runId'
+#  and that the field for the partition column inside the
+#  'spark.sql.sources.schema' JSON is named `runId` too, so that Spark's view
+#  of the table uses the camelCase name -- including when it creates
+#  partition directories.
+#
+#  WHAT CANNOT BE CHANGED (and why the two cases coexist)
+#  -----------------------------------------------------
+#  The Hive metastore LOWERCASES every column name. There is no DDL that
+#  makes it store `runId`:
+#      SHOW CREATE TABLE  -> PARTITIONED BY (runid string)     always
+#      SHOW PARTITIONS    -> runid=<uuid>                      always
+#  So the Hive column stays `runid` and only Spark's schema properties carry
+#  `runId`. That is not a defect, it is how Spark preserves column case on
+#  Hive -- the same mechanism already keeps the camelCase data columns
+#  (matrixMigrationName, asOfDate, notationCode) readable.
+#
+#  Consequence, and the reason this matters: Spark names the partition
+#  DIRECTORIES after its own schema, so once partCol.0 is `runId` a Spark
+#  write produces runId=<uuid>/ rather than runid=<uuid>/. That is what makes
+#  the camelCase directory layout self-sustaining instead of something a
+#  rename has to keep fixing up.
+#
+#  The script therefore RENAMES the partition field inside the schema JSON to
+#  PARTITION_COL. Data columns are never re-cased.
 #
 #  TWO MODES -- read this before choosing
 #  --------------------------------------
@@ -59,14 +80,23 @@ DRY_RUN    = True                # must stay True until the DDL is reviewed
 
 FIX_MODE   = "recreate"          # "alter" (safe, in place) | "recreate" (drop + create)
 
-PARTITION_COL  = "runid"         # the canonical lowercase partition column
+# The partition column AS SPARK SEES IT. This is the case written into
+# spark.sql.sources.schema.partCol.0 and into the schema JSON field name, and
+# it is the case Spark uses when it creates partition directories.
+#
+# NOTE: the HIVE column is ALWAYS lowercase. The metastore lowercases every
+# column name, so SHOW CREATE TABLE keeps showing PARTITIONED BY (runid string)
+# and SHOW PARTITIONS keeps returning runid=<uuid> whatever you put here. Only
+# Spark's own view of the table can carry the camelCase.
+PARTITION_COL  = "runId"
 PARTITION_TYPE = "string"
+HIVE_PARTITION_COL = PARTITION_COL.lower()   # what the metastore actually stores
 
 # Directory key used by the partition LOCATIONs when they have to be rebuilt.
 # Set to "runId" if you ran rename_partitions_to_runId.py, "runid" otherwise.
 # Only used in "recreate" mode for partitions whose location cannot be read
 # back from the metastore.
-ON_DISK_KEY = "runid"
+ON_DISK_KEY = "runId"
 
 DDL_OUTPUT_PATH    = "/Projects/STCreditRisk_UAT/tmp/recreate_table_ddl.sql"
 BACKUP_OUTPUT_PATH = "/Projects/STCreditRisk_UAT/tmp/table_definition_backup.sql"
@@ -260,7 +290,7 @@ for k in ("Table Type", "Type"):
 location = detail.get("Location") or None
 
 # The partition column is also listed among the data columns; drop it there.
-part_names = set(n.lower() for n, _ in part_cols) or {PARTITION_COL}
+part_names = set(n.lower() for n, _ in part_cols) or {HIVE_PARTITION_COL}
 data_cols  = [(n, t) for n, t in data_cols if n.lower() not in part_names]
 
 if not location:
@@ -404,13 +434,23 @@ if schema_json is None:
 # The partition column must be present in the schema JSON, and last.
 parsed = json.loads(schema_json)
 names  = [f["name"] for f in parsed["fields"]]
-if PARTITION_COL not in [n.lower() for n in names]:
+hit    = [i for i, n in enumerate(names) if n.lower() == HIVE_PARTITION_COL]
+if not hit:
     parsed["fields"].append({"name": PARTITION_COL, "type": PARTITION_TYPE,
                              "nullable": True, "metadata": {}})
-    schema_json = json.dumps(parsed)
     names.append(PARTITION_COL)
+    schema_json = json.dumps(parsed)
     log("WARN", "partition column %r was missing from the schema JSON - appended"
                 % PARTITION_COL)
+elif names[hit[0]] != PARTITION_COL:
+    # This rename is the whole point: Hive cannot store the camelCase, so the
+    # schema JSON is the only place the wanted case can live.
+    was = names[hit[0]]
+    parsed["fields"][hit[0]]["name"] = PARTITION_COL
+    names[hit[0]] = PARTITION_COL
+    schema_json = json.dumps(parsed)
+    log("INFO", "partition column re-cased in the schema JSON: %r -> %r"
+                % (was, PARTITION_COL))
 
 log("INFO", "schema source     : %s" % schema_source)
 log("INFO", "schema fields     : %s" % ", ".join(names))
@@ -466,7 +506,7 @@ else:
     for value, loc in partitions:
         statements.append(
             "ALTER TABLE %s ADD IF NOT EXISTS PARTITION (%s='%s') LOCATION '%s';"
-            % (HIVE_TABLE, PARTITION_COL, value, loc))
+            % (HIVE_TABLE, HIVE_PARTITION_COL, value, loc))
 
 header = ("-- generated by recreate_table_partcol_runid.py on %s\n"
           "-- table     : %s   (type: %s, purge: %s)\n"
@@ -495,7 +535,7 @@ backup_text = (
        "\n".join("-- %s = %s" % (k, v) for k, v in sorted(tblprops.items())) or "-- (none)",
        len(partitions),
        "\n".join("ALTER TABLE %s ADD IF NOT EXISTS PARTITION (%s='%s') LOCATION '%s';"
-                 % (HIVE_TABLE, PARTITION_COL, v, l) for v, l in partitions) or "-- (none)"))
+                 % (HIVE_TABLE, HIVE_PARTITION_COL, v, l) for v, l in partitions) or "-- (none)"))
 
 backup_ok = write_text(BACKUP_OUTPUT_PATH, backup_text)
 write_text(DDL_OUTPUT_PATH, ddl_text)

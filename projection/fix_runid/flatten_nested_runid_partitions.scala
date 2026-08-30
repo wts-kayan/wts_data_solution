@@ -85,9 +85,16 @@ val DRY_RUN       = true          // must stay true until the plan has been revi
 val HIVE_TABLE    = "dbprojection.term_structure"
 val EMIT_HIVE_DDL = true
 
-// Canonical (lowercase) partition key -- PARTITIONED BY (runid string).
-// Any first-level directory whose key is not EXACTLY this one is a wrapper.
-val PARTITION_KEY = "runid"
+// Canonical on-disk partition key, case-sensitive. Any first-level directory
+// whose key is not EXACTLY this one is treated as a wrapper.
+//
+// The Hive column is always lowercase `runid` (the metastore lowercases every
+// column name); this constant is the DIRECTORY spelling, which Spark takes
+// from spark.sql.sources.schema.partCol.0. Keep the two consistent: if
+// partCol.0 is `runId` (see recreate_table_partcol_runid.scala) then the
+// directories should be runId= too.
+val PARTITION_KEY    = "runId"
+val PARTITION_KEY_LC = PARTITION_KEY.toLowerCase   // what the metastore stores
 
 // Where the generated DDL is written. Any Hadoop-addressable path
 // (hdfs://..., file:/...). Set to null to skip the file and only print.
@@ -223,7 +230,7 @@ rootEntries.foreach { st =>
       val childDirs  = children.filter(c => c.isDirectory && !isProtected(c.getPath.getName))
       val childFiles = children.filter(c => !c.isDirectory && !isProtected(c.getPath.getName))
       val nestedPartDirs = childDirs.filter(c =>
-        splitKey(c.getPath.getName)._1.toLowerCase == PARTITION_KEY)
+        splitKey(c.getPath.getName)._1.toLowerCase == PARTITION_KEY_LC)
 
       if (isCanonicalKey && childDirs.isEmpty) {
         // runid=<X>/part-*.orc -> already flat, nothing to do
@@ -246,7 +253,9 @@ rootEntries.foreach { st =>
 
         if (nestedPartDirs.isEmpty) {
           skipped += ((full, s"single child dir '$innerName' is not a $PARTITION_KEY= partition dir"))
-        } else if (innerKey != PARTITION_KEY) {
+        // Case-insensitive on purpose: runId=<X>/runid=<X> is exactly the
+        // defect, so the inner dir may differ from the canonical key in case.
+        } else if (innerKey.toLowerCase != PARTITION_KEY_LC) {
           skipped += ((full, s"nested dir key is '$innerKey=' not '$PARTITION_KEY=' - " +
             "unknown nesting, review manually"))
         } else if (childFiles.nonEmpty) {
@@ -440,7 +449,8 @@ if (METASTORE_PREFLIGHT && !tableExists(HIVE_TABLE)) {
             if (!existsTry.get)                                partOrphan  += ((spec, loc))
             else if (rel.isEmpty)                              partOutside += ((spec, loc))
             else if (rel.get.length == 1 &&
-                     rel.get(0) == s"$PARTITION_KEY=$pval")    partOk      += ((spec, loc))
+                     rel.get(0).toLowerCase ==
+                       s"$PARTITION_KEY=$pval".toLowerCase)      partOk      += ((spec, loc))
             else                                               partNested  += ((spec, loc))
           }
         }
@@ -650,8 +660,8 @@ if (EMIT_HIVE_DDL) {
       if (unregisteredValues.contains(value))
         "-- NOTE: this run id was NOT registered in the metastore before the fix\n"
       else ""
-    ddlStatements += s"${tag}ALTER TABLE $HIVE_TABLE\n  DROP IF EXISTS PARTITION ($PARTITION_KEY='$value');"
-    ddlStatements += s"ALTER TABLE $HIVE_TABLE\n  ADD IF NOT EXISTS PARTITION ($PARTITION_KEY='$value')\n  LOCATION '$loc';"
+    ddlStatements += s"${tag}ALTER TABLE $HIVE_TABLE\n  DROP IF EXISTS PARTITION ($PARTITION_KEY_LC='$value');"
+    ddlStatements += s"ALTER TABLE $HIVE_TABLE\n  ADD IF NOT EXISTS PARTITION ($PARTITION_KEY_LC='$value')\n  LOCATION '$loc';"
   }
 
   partOrphan.foreach { case (spec, loc) =>
@@ -667,7 +677,7 @@ if (EMIT_HIVE_DDL) {
   // commented out for a human to enable.
   val commented = unregistered.filter(_._3 == "canonical dir").map { case (full, value, _) =>
     "-- UNREGISTERED canonical dir, review before enabling:\n" +
-    s"-- ALTER TABLE $HIVE_TABLE ADD IF NOT EXISTS PARTITION ($PARTITION_KEY='$value') LOCATION '$full';"
+    s"-- ALTER TABLE $HIVE_TABLE ADD IF NOT EXISTS PARTITION ($PARTITION_KEY_LC='$value') LOCATION '$full';"
   }
 
   val header =
