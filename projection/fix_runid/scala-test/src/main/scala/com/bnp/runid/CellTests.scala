@@ -207,6 +207,47 @@ object CellTests {
          |LOCATION '${uri(root)}'""".stripMargin)
   }
 
+  /** The REAL term_structure shape, nested column included. The production
+    * table carries `matrix array<array<double>>`, and the recreate cell has to
+    * round-trip that through the Spark schema JSON, where a nested type must be
+    * a nested JSON object and not the DDL string. Every other fixture here is
+    * four plain strings, which would never exercise that. */
+  private def createNestedTable(db: String, table: String, root: JPath): Unit = {
+    spark.sql(s"DROP TABLE IF EXISTS $db.$table")
+    spark.sql(
+      s"""CREATE EXTERNAL TABLE $db.$table (
+         |  `matrixMigrationName` string,
+         |  `asOfDate` string,
+         |  `scenario` string,
+         |  `notationCode` string,
+         |  `matrix` array<array<double>>)
+         |PARTITIONED BY (`runid` string)
+         |STORED AS ORC
+         |LOCATION '${uri(root)}'""".stripMargin)
+  }
+
+  /** An ORC partition carrying the nested `matrix` column, so the recreated
+    * table can be read back and the nested values actually compared. */
+  private def writeNestedPartition(root: JPath, value: String): Unit = {
+    val dir = root.resolve(s"runId=$value")
+    Files.createDirectories(dir)
+    val tmp = Files.createTempDirectory("orcgen-")
+    spark.range(2L)
+      .selectExpr(
+        "concat('mig', cast(id as string)) as matrixMigrationName",
+        "'2026-01-01' as asOfDate",
+        "'base' as scenario",
+        "concat('AA', cast(id as string)) as notationCode",
+        "array(array(cast(id as double), 1.5d), array(2.5d)) as matrix")
+      .repartition(1)
+      .write.mode("overwrite").orc(tmp.resolve("out").toUri.toString)
+    val s = Files.list(tmp.resolve("out"))
+    try s.iterator().asScala
+        .filter(_.getFileName.toString.endsWith(".orc"))
+        .foreach(p => Files.copy(p, dir.resolve(p.getFileName.toString)))
+    finally s.close()
+  }
+
   private def addPartition(db: String, table: String, value: String, loc: String): Unit =
     spark.sql(s"ALTER TABLE $db.$table ADD IF NOT EXISTS PARTITION (runid='$value') " +
               s"LOCATION '$loc'")
@@ -640,6 +681,45 @@ object CellTests {
                    spark.sql(s"SHOW PARTITIONS $DB.rec_many").count())
       assertEquals("and the rows must still be readable through the table", 3L,
                    spark.table(s"$DB.rec_many").count())
+    }
+
+    // The production table is not four strings: it carries
+    // `matrix array<array<double>>`. recreate rebuilds the table from a schema
+    // JSON, where a nested type has to be a nested JSON object rather than the
+    // DDL string, so this is the one column shape that can break the CREATE
+    // after the DROP has already happened.
+    check("a nested array<array<double>> column survives the recreate") {
+      val root = newRoot("recreate-nested")
+      writeNestedPartition(root, "aaa1")
+      writeNestedPartition(root, "bbb2")
+      createNestedTable(DB, "rec_nested", root)
+      Seq("aaa1", "bbb2").foreach(v =>
+        addPartition(DB, "rec_nested", v, uri(root) + s"/runId=$v"))
+      generated.RecreateCell.run(spark, Map(
+        "HIVE_TABLE" -> s"$DB.rec_nested", "TABLE_ROOT" -> uri(root),
+        "DRY_RUN" -> "false", "FIX_MODE" -> "recreate",
+        "DDL_OUTPUT_PATH" -> ddl(root, "rec-nested.sql"),
+        "BACKUP_OUTPUT_PATH" -> ddl(root, "rec-nested-backup.sql")))
+
+      val schema = spark.table(s"$DB.rec_nested").schema
+      assertTrue("the partition column must be camelCase, got " +
+                 schema.fieldNames.mkString(","),
+                 schema.fieldNames.contains("runId"))
+      val matrix = schema.fields.find(_.name == "matrix")
+        .getOrElse(throw new AssertionError("the matrix column is gone, got " +
+                                            schema.fieldNames.mkString(",")))
+      assertEquals("the nested type must round-trip intact",
+                   "array<array<double>>", matrix.dataType.simpleString)
+      assertEquals("every partition must come back", 2L,
+                   spark.sql(s"SHOW PARTITIONS $DB.rec_nested").count())
+      // and the nested values must still READ, not merely typecheck
+      val rows = spark.sql(
+        s"SELECT matrix FROM $DB.rec_nested WHERE runId = 'aaa1' " +
+        "ORDER BY notationCode").collect()
+      assertEquals("both rows of the partition must read back", 2, rows.length)
+      assertEquals("the nested value must survive",
+                   Seq(Seq(0.0d, 1.5d), Seq(2.5d)),
+                   rows(0).getSeq[Seq[Double]](0).map(_.toSeq).toSeq)
     }
   }
 

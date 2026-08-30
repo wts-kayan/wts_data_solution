@@ -72,7 +72,13 @@ resulting tree and metastore.
 |---|---|
 | flatten | dry run changes nothing; `runId=X/runid=X` collapses to `runId=X` in one pass and the metastore is re-pointed; second apply is a no-op; a UUID mismatch is skipped, never merged; a name collision on merge keeps both files; markers stay put and their dir survives; `DELETE_MARKERS_ON_MERGE=true` clears it |
 | rename | `runid=X` becomes `runId=X` and is re-pointed; a still-nested dir is refused; `MERGE_ON_COLLISION=false` refuses a colliding target; `MERGE_ON_COLLISION=true` loses no file, colliding or not |
-| recreate | dry run touches nothing; `alter` mode refuses to execute and leaves the table alone; `recreate` mode really lands `runId` in Spark's schema; aborts on MANAGED; aborts once, with diagnostics, on an invisible table; the backup replays the pre-drop definition; every partition is re-registered, not just the first |
+| recreate | dry run touches nothing; `alter` mode refuses to execute and leaves the table alone; `recreate` mode really lands `runId` in Spark's schema; aborts on MANAGED; aborts once, with diagnostics, on an invisible table; the backup replays the pre-drop definition; every partition is re-registered, not just the first; a nested `array<array<double>>` column survives |
+
+The nested-column test uses the real `term_structure` shape rather than the
+four plain strings the other fixtures use. Production carries `matrix
+array<array<double>>`, and `recreate` rebuilds the table from a schema JSON in
+which a nested type has to be a nested JSON object, not the DDL string. It is
+the one column shape whose failure would land *after* the `DROP`.
 
 The merge tests are the ones that matter most, because merging is the only
 place the cells can lose data: files are moved into a directory that already
@@ -88,7 +94,7 @@ The local filesystem stands in for HDFS. That is faithful for what the cells do
 
 ## Environment notes (Windows)
 
-All 18 tests run on Windows. Two things had to be arranged for that, both
+All 19 tests run on Windows. Two things had to be arranged for that, both
 handled automatically:
 
 **Case sensitivity.** Telling `runId=` from `runid=` is the entire point, and
