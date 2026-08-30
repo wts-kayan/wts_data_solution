@@ -198,10 +198,8 @@ section(s"1/5  CAPTURE  (mode=$MODE, fix_mode=$FIX_MODE)  table=$HIVE_TABLE")
 // all, fail once with a useful message instead of one stack trace per query.
 if (!tableExists(HIVE_TABLE))
   sys.error(s"ABORT: table $HIVE_TABLE is not visible to this Spark session, so its " +
-            "definition cannot be captured. Nothing was modified.
-  " +
-            catalogDiagnostics(HIVE_TABLE).mkString("
-  "))
+            "definition cannot be captured. Nothing was modified.\n  " +
+            catalogDiagnostics(HIVE_TABLE).mkString("\n  "))
 log("OK", s"table $HIVE_TABLE is visible to this session")
 
 var showCreate = ""
