@@ -1,4 +1,4 @@
-# Compile + test harness for the `fix_runid` Scala cells
+# Compile + test harness for the projection Scala cells
 
 The three `.scala` scripts in the parent directory are Dataiku notebook **cells**:
 a flat sequence of top-level statements. `scalac` cannot compile that — Scala 2
@@ -73,6 +73,7 @@ resulting tree and metastore.
 | flatten | dry run changes nothing; `runId=X/runid=X` collapses to `runId=X` in one pass and the metastore is re-pointed; second apply is a no-op; a UUID mismatch is skipped, never merged; a name collision on merge keeps both files; markers stay put and their dir survives; `DELETE_MARKERS_ON_MERGE=true` clears it; a marker-only nested dir is left and named by default, removed with the flag, and never dropped if data appeared in it; a leftover is cleared by a re-run with the flag on; a surviving nested dir is named in the report |
 | rename | `runid=X` becomes `runId=X` and is re-pointed; a still-nested dir is refused; `MERGE_ON_COLLISION=false` refuses a colliding target; `MERGE_ON_COLLISION=true` loses no file, colliding or not |
 | recreate | dry run touches nothing; `alter` mode refuses to execute and leaves the table alone; `recreate` mode really lands `runId` in Spark's schema; aborts on MANAGED; aborts once, with diagnostics, on an invisible table; the backup replays the pre-drop definition; every partition is re-registered, not just the first; a nested `array<array<double>>` column survives |
+| unpurge-drop | dry run mutates nothing; a non-partitioned table is never altered nor dropped; a MANAGED table is reported and never dropped; the purge flag is flipped and verified BEFORE the drop and the data directory survives; a table already at `false` is dropped without an ALTER; the artefacts name every table on the right side; a second run is a clean no-op; an unwritable DDL backup aborts before any change |
 
 The nested-column test uses the real `term_structure` shape rather than the
 four plain strings the other fixtures use. Production carries `matrix
@@ -112,7 +113,7 @@ The local filesystem stands in for HDFS. That is faithful for what the cells do
 
 ## Environment notes (Windows)
 
-All 24 tests run on Windows. Two things had to be arranged for that, both
+All 32 tests run on Windows. Two things had to be arranged for that, both
 handled automatically:
 
 **Case sensitivity.** Telling `runId=` from `runid=` is the entire point, and

@@ -337,6 +337,62 @@ object CellTests {
   }
 
   // ------------------------------------------------------------------
+  // Fixtures for unpurge_and_drop_dbprojection
+  // ------------------------------------------------------------------
+
+  /** A throwaway database with an explicit LOCATION. Explicit on purpose: it
+    * keeps the database out of the warehouse, whose creation path is the one
+    * that needs the NativeIO POSIX symbol Windows lacks. */
+  private def makeDb(name: String): JPath = {
+    val loc = Files.createTempDirectory(s"dropdb-$name-")
+    spark.sql(s"DROP DATABASE IF EXISTS $name CASCADE")
+    spark.sql(s"CREATE DATABASE $name LOCATION '${uri(loc)}'")
+    loc
+  }
+
+  /** EXTERNAL, partitioned, with one registered partition and real files --
+    * the shape the script is built for. `purge` mirrors CDP's
+    * TRANSLATED_TO_EXTERNAL tables, where DROP would delete the data. */
+  private def extPartTable(db: String, t: String, purge: Boolean): JPath = {
+    val root = newRoot(s"dropdata-$t-")
+    writeOrcPartition(root, "runid", "aaa1", 1)
+    spark.sql(s"DROP TABLE IF EXISTS $db.$t")
+    spark.sql(
+      s"""CREATE EXTERNAL TABLE $db.$t (`a` string)
+         |PARTITIONED BY (`runid` string)
+         |STORED AS ORC
+         |LOCATION '${uri(root)}'
+         |TBLPROPERTIES ('external.table.purge'='${purge.toString}',
+         |               'TRANSLATED_TO_EXTERNAL'='TRUE')""".stripMargin)
+    spark.sql(s"ALTER TABLE $db.$t ADD IF NOT EXISTS PARTITION (runid='aaa1') " +
+              s"LOCATION '${uri(root)}/runid=aaa1'")
+    root
+  }
+
+  /** EXTERNAL but NOT partitioned -- must never be altered and never dropped. */
+  private def extPlainTable(db: String, t: String): JPath = {
+    val root = newRoot(s"dropdata-$t-")
+    spark.sql(s"DROP TABLE IF EXISTS $db.$t")
+    spark.sql(
+      s"""CREATE EXTERNAL TABLE $db.$t (`a` string)
+         |STORED AS ORC
+         |LOCATION '${uri(root)}'
+         |TBLPROPERTIES ('external.table.purge'='true')""".stripMargin)
+    root
+  }
+
+  private def tableNames(db: String): Set[String] =
+    spark.sql(s"SHOW TABLES IN $db").collect().map(_.getAs[String]("tableName")).toSet
+
+  private def purgeOf(db: String, t: String): String =
+    spark.sessionState.catalog
+      .getTableMetadata(new org.apache.spark.sql.catalyst.TableIdentifier(t, Some(db)))
+      .properties.getOrElse("external.table.purge", "")
+
+  private def readArtifact(dir: JPath, name: String): String =
+    new String(Files.readAllBytes(dir.resolve(name)), "UTF-8")
+
+  // ------------------------------------------------------------------
   // The tests
   // ------------------------------------------------------------------
 
@@ -843,6 +899,163 @@ object CellTests {
     }
   }
 
+  private def dropTablesTests(): Unit = {
+    println("")
+    println("unpurge_and_drop_dbprojection.scala")
+
+    def cfg(db: String, out: JPath, dry: Boolean) = Map(
+      "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString,
+      "DRY_RUN" -> dry.toString, "CHECK_INVENTORY" -> "false")
+
+    check("DRY_RUN alters nothing and drops nothing") {
+      val db = "dropdb_dry"
+      makeDb(db)
+      extPartTable(db, "part_purge", purge = true)
+      extPlainTable(db, "plain_one")
+      val out = Files.createTempDirectory("dropout-dry-")
+      generated.UnpurgeDropCell.run(spark, cfg(db, out, dry = true))
+      assertEquals("both tables must still exist",
+                   Set("part_purge", "plain_one"), tableNames(db))
+      assertEquals("the purge flag must be untouched", "true",
+                   purgeOf(db, "part_purge"))
+    }
+
+    // The acceptance criterion that protects the other 60-odd tables: a table
+    // with no partition column is never altered and never dropped.
+    check("a non-partitioned table is never altered nor dropped") {
+      val db = "dropdb_scope"
+      makeDb(db)
+      extPartTable(db, "part_purge", purge = true)
+      extPlainTable(db, "plain_one")
+      val out = Files.createTempDirectory("dropout-scope-")
+      generated.UnpurgeDropCell.run(spark, cfg(db, out, dry = false))
+      assertTrue("the non-partitioned table must survive",
+                 tableNames(db).contains("plain_one"))
+      assertEquals("and its purge flag must be untouched", "true",
+                   purgeOf(db, "plain_one"))
+      assertFalse("while the partitioned one is dropped",
+                  tableNames(db).contains("part_purge"))
+    }
+
+    check("a MANAGED table is reported and never dropped") {
+      val db = "dropdb_managed"
+      makeDb(db)
+      spark.sql(s"CREATE TABLE $db.man_one (a string) PARTITIONED BY (runid string) " +
+                "STORED AS ORC")
+      val out = Files.createTempDirectory("dropout-managed-")
+      generated.UnpurgeDropCell.run(spark, cfg(db, out, dry = false))
+      assertTrue("the MANAGED table must still exist",
+                 tableNames(db).contains("man_one"))
+      assertTrue("and must be named in the report",
+                 readArtifact(out, "dbprojection_preflight_report.csv").contains("MANAGED"))
+    }
+
+    check("purge is flipped to false before the table is dropped") {
+      val db = "dropdb_flip"
+      makeDb(db)
+      val data = extPartTable(db, "part_purge", purge = true)
+      val out = Files.createTempDirectory("dropout-flip-")
+      val out2 = capturingStdout {
+        generated.UnpurgeDropCell.run(spark, cfg(db, out, dry = false))
+      }
+      assertFalse("the table must be dropped", tableNames(db).contains("part_purge"))
+      assertTrue("the data directory must survive the drop", Files.exists(data))
+      assertTrue("the partition data must still be there",
+                 Files.exists(data.resolve("runid=aaa1")))
+      val alterAt = out2.indexOf("ALTER  " + db + ".part_purge")
+      val dropAt  = out2.indexOf("DROP   " + db + ".part_purge")
+      assertTrue("the ALTER must be logged, got none", alterAt >= 0)
+      assertTrue("the DROP must be logged, got none", dropAt >= 0)
+      assertTrue("the ALTER must come BEFORE the DROP", alterAt < dropAt)
+      assertTrue("the verification must run between them",
+                 out2.indexOf("VERIFY " + db + ".part_purge") > alterAt)
+    }
+
+    check("a table already at purge=false is dropped without an ALTER") {
+      val db = "dropdb_noalter"
+      makeDb(db)
+      extPartTable(db, "part_plain", purge = false)
+      val out = Files.createTempDirectory("dropout-noalter-")
+      val out2 = capturingStdout {
+        generated.UnpurgeDropCell.run(spark, cfg(db, out, dry = false))
+      }
+      assertFalse("it must still be dropped", tableNames(db).contains("part_plain"))
+      assertTrue("and the ALTER must be skipped, not issued",
+                 out2.contains("SKIP ALTER " + db + ".part_plain"))
+    }
+
+    check("the artefacts name every table on the right side") {
+      val db = "dropdb_art"
+      makeDb(db)
+      extPartTable(db, "part_purge", purge = true)
+      extPlainTable(db, "plain_one")
+      val out = Files.createTempDirectory("dropout-art-")
+      generated.UnpurgeDropCell.run(spark, cfg(db, out, dry = true))
+
+      val ddl = readArtifact(out, "dbprojection_ddl_backup.sql")
+      assertTrue("the DDL backup must cover the in-scope table",
+                 ddl.contains("part_purge"))
+      assertTrue("and the out-of-scope one too - it is deliberately wider",
+                 ddl.contains("plain_one"))
+
+      val alterSql = readArtifact(out, "dbprojection_alter_purge.sql")
+      assertTrue("the ALTER file must carry the in-scope table",
+                 alterSql.contains("ALTER TABLE " + db + ".part_purge"))
+      assertFalse("and must never carry the non-partitioned one",
+                  alterSql.contains("plain_one"))
+
+      val dropText = readArtifact(out, "dbprojection_drop_tables.sql")
+      assertTrue("the DROP file must carry the in-scope table",
+                 dropText.contains("DROP TABLE IF EXISTS " + db + ".part_purge;"))
+      assertFalse("and must never carry the non-partitioned one",
+                  dropText.contains("plain_one"))
+      assertTrue("and must warn about running it before the ALTER",
+                 dropText.contains("NEVER run this file before"))
+
+      val oos = readArtifact(out, "dbprojection_out_of_scope.txt")
+      assertTrue("the exclusion must be auditable", oos.contains("plain_one"))
+      assertFalse("and must not list an in-scope table", oos.contains("part_purge"))
+
+      val locs = readArtifact(out, "dbprojection_locations.txt")
+      assertTrue("locations must be captured before any drop",
+                 locs.contains("part_purge") && locs.contains("plain_one"))
+    }
+
+    // Re-running after a partial run is the realistic case: 85 tables, one
+    // fails, you fix it and go again.
+    check("a second run is a clean no-op") {
+      val db = "dropdb_idem"
+      makeDb(db)
+      extPartTable(db, "part_purge", purge = true)
+      extPlainTable(db, "plain_one")
+      val out = Files.createTempDirectory("dropout-idem-")
+      generated.UnpurgeDropCell.run(spark, cfg(db, out, dry = false))
+      val after = tableNames(db)
+      generated.UnpurgeDropCell.run(spark, cfg(db, out, dry = false))
+      assertEquals("the second run must change nothing", after, tableNames(db))
+      assertTrue("and the non-partitioned table must still be there",
+                 tableNames(db).contains("plain_one"))
+    }
+
+    // The backup is the only way back from a DROP, so an unwritable one has to
+    // stop the run before anything is altered.
+    check("an unwritable DDL backup aborts before any change") {
+      val db = "dropdb_nobackup"
+      makeDb(db)
+      extPartTable(db, "part_purge", purge = true)
+      var msg = ""
+      try {
+        // a FILE where the output directory has to go, so the create cannot work
+        val clash = Files.createTempFile("dropout-clash-", ".txt")
+        generated.UnpurgeDropCell.run(spark, cfg(db, clash, dry = false))
+      } catch { case e: RuntimeException => msg = String.valueOf(e.getMessage) }
+      assertTrue("must abort naming the backup, got: " + msg,
+                 msg.contains("DDL backup") || msg.contains("Refusing"))
+      assertTrue("the table must be untouched", tableNames(db).contains("part_purge"))
+      assertEquals("and its purge flag unchanged", "true", purgeOf(db, "part_purge"))
+    }
+  }
+
   // ------------------------------------------------------------------
 
   def main(args: Array[String]): Unit = {
@@ -856,6 +1069,7 @@ object CellTests {
       flattenTests()
       renameTests()
       recreateTests()
+      dropTablesTests()
     } finally {
       if (spark != null) spark.stop()
     }
