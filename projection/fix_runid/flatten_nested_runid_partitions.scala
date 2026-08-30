@@ -265,19 +265,25 @@ rootEntries.foreach { st =>
         } else if (innerKey.toLowerCase != PARTITION_KEY_LC) {
           skipped += ((full, s"nested dir key is '$innerKey=' not '$PARTITION_KEY=' - " +
             "unknown nesting, review manually"))
-        } else if (childFiles.nonEmpty) {
-          skipped += ((full, s"wrapper holds ${childFiles.length} data file(s) AND a " +
-            s"nested '$innerName' dir - ambiguous, review manually"))
-        } else if (value.toLowerCase != innerValue.toLowerCase) {
-          skipped += ((full, s"UUID MISMATCH outer='$value' inner='$innerValue' - would " +
-            "merge two distinct runs, never guessed"))
         } else {
+          // What the nested dir HOLDS decides everything below, so read it
+          // before judging the wrapper. In particular a wrapper with data
+          // files next to a nested dir is only ambiguous when that nested dir
+          // has data of its own; if it holds nothing but markers it is simply
+          // the aftermath of an earlier merge, which is not a question for a
+          // human.
           val innerChildren = ls(inner.getPath)
           val innerData     = innerChildren.filter(c => !isProtected(c.getPath.getName))
           val innerProt     = innerChildren.filter(c => isProtected(c.getPath.getName))
           val innerSubdirs  = innerData.filter(_.isDirectory)
 
-          if (innerSubdirs.nonEmpty) {
+          if (childFiles.nonEmpty && innerData.nonEmpty) {
+            skipped += ((full, s"wrapper holds ${childFiles.length} data file(s) AND a " +
+              s"nested '$innerName' dir that also holds data - ambiguous, review manually"))
+          } else if (value.toLowerCase != innerValue.toLowerCase) {
+            skipped += ((full, s"UUID MISMATCH outer='$value' inner='$innerValue' - would " +
+              "merge two distinct runs, never guessed"))
+          } else if (innerSubdirs.nonEmpty) {
             skipped += ((inner.getPath.toString,
               s"nested dir contains sub-directories " +
               s"(${innerSubdirs.map(_.getPath.getName).mkString(", ")}) - deeper nesting, " +
@@ -287,10 +293,22 @@ rootEntries.foreach { st =>
             plans += Plan("drop_empty", st.getPath, inner.getPath, null, value, 0, 0L,
                           Seq.empty, isCanonicalKey)
           } else if (innerData.isEmpty) {
-            skipped += ((inner.getPath.toString,
-              s"nested dir only contains protected entries " +
-              s"(${innerChildren.map(_.getPath.getName).mkString(", ")}) - no data to " +
-              "promote, remove manually"))
+            // Nothing but _SUCCESS / .hive-staging / hidden entries. There is
+            // no data to promote, so the merge path never runs and this dir
+            // would survive every re-run -- yet it is still a nested
+            // PARTITION_KEY= dir, which is the whole layout being removed.
+            // The same flag that governs discarding those markers on a merge
+            // governs discarding them here.
+            if (DELETE_MARKERS_ON_MERGE) {
+              plans += Plan("drop_markers", st.getPath, inner.getPath, null, value,
+                            0, 0L, innerProt.map(_.getPath.getName).toSeq, isCanonicalKey)
+            } else {
+              skipped += ((inner.getPath.toString,
+                s"nested dir only contains protected entries " +
+                s"(${innerChildren.map(_.getPath.getName).mkString(", ")}) - no data to " +
+                "promote. Set DELETE_MARKERS_ON_MERGE = true to have it removed, or " +
+                "remove it manually"))
+            }
             innerProt.foreach(c =>
               protectedSeen += ((c.getPath.toString, "marker inside a data-less nested dir")))
           } else {
@@ -524,6 +542,10 @@ plans.foreach { p =>
     case "drop_empty" =>
       log("PLAN", s"DELETE ${p.inner}   (nested dir is empty, no data at risk)")
       if (!p.selfNested) log("PLAN", s"DELETE ${p.wrapper}   (empty wrapper)")
+    case "drop_markers" =>
+      log("PLAN", s"DELETE ${p.inner}   (holds only ${p.protectedNames.mkString(", ")}, " +
+                  "no data at risk, DELETE_MARKERS_ON_MERGE=true)")
+      if (!p.selfNested) log("PLAN", s"DELETE ${p.wrapper}   (empty wrapper)")
     case _ =>
   }
 }
@@ -535,7 +557,7 @@ plans.foreach { p =>
 section(s"4/7  EXECUTION  (mode=$MODE)")
 
 val flattened = ArrayBuffer[String]()   // run ids successfully flattened -> feed the DDL
-var cRename = 0; var cMerge = 0; var cDropEmpty = 0
+var cRename = 0; var cMerge = 0; var cDropEmpty = 0; var cMarkerDirsDeleted = 0
 var cFilesMoved = 0; var cWrappersDeleted = 0; var cFailed = 0
 
 /** Delete `path` only after verifying it holds nothing at all. */
@@ -569,6 +591,26 @@ if (DRY_RUN) {
       cDropEmpty += 1
       deleteIfEmpty(inner, "empty nested dir")
       if (!p.selfNested && deleteIfEmpty(wrapper, "empty wrapper")) cWrappersDeleted += 1
+    } else if (p.kind == "drop_markers") {
+      // Re-verify at execution time: the plan was built earlier, and this is
+      // the one branch that deletes a non-empty directory. If anything that is
+      // not a marker has appeared since the scan, leave it alone.
+      val nowInside = ls(inner)
+      val nowData   = nowInside.filter(c => !isProtected(c.getPath.getName))
+      if (nowData.nonEmpty) {
+        log("WARN", s"data appeared in $inner since the scan " +
+                    s"(${nowData.map(_.getPath.getName).mkString(", ")}) - NOT deleted")
+        skipped += ((inner.toString,
+          "data appeared between the scan and the execution - re-run to flatten it"))
+      } else if (fs.delete(inner, true)) {
+        cMarkerDirsDeleted += 1
+        log("OK", s"DELETE $inner   (held only " +
+                  s"${nowInside.map(_.getPath.getName).mkString(", ")})")
+        if (!p.selfNested && deleteIfEmpty(wrapper, "empty wrapper")) cWrappersDeleted += 1
+      } else {
+        cFailed += 1
+        log("ERROR", s"DELETE FAILED $inner")
+      }
     } else {
       if (p.kind == "rename") {
         // Re-check just before mutating: the plan was built earlier.
@@ -758,6 +800,33 @@ val skippedPaths = skipped.map(_._1).toSet
 val unresolved    = remainingWrappers.filter(w => plannedPaths.contains(w) && !DRY_RUN)
 val leftByDesign  = remainingWrappers.filterNot(unresolved.contains)
 
+// A wrapper that IS canonical (runId=X holding a nested runid=X) is invisible
+// to the scan above, which only looks at first-level keys. That nesting is
+// exactly the defect being removed, and it survives a merge whenever the
+// nested dir still holds a protected entry -- so re-scan the final state for
+// it rather than trusting the bookkeeping. Fresh listing on purpose: it
+// reports what is actually on disk now, whatever the plan believed.
+val nestedLeftovers = ls(root).filter(_.isDirectory).flatMap { st =>
+  ls(st.getPath).filter { c =>
+    c.isDirectory && splitKey(c.getPath.getName)._1.toLowerCase == PARTITION_KEY_LC
+  }.map(_.getPath.toString)
+}
+
+if (nestedLeftovers.nonEmpty) {
+  log("WARN", s"${nestedLeftovers.length} nested '$PARTITION_KEY=' dir(s) still under a " +
+              "partition dir:")
+  nestedLeftovers.foreach { np =>
+    val holds = Try(ls(new Path(np)).map(_.getPath.getName).mkString(", ")).getOrElse("?")
+    log(if (DRY_RUN) "WARN" else "ERROR", s"  $np   (holds: $holds)")
+  }
+  if (!DRY_RUN)
+    log("ERROR", "-> the nested layout is NOT fully removed. Marker-only dirs are left " +
+                 "in place unless DELETE_MARKERS_ON_MERGE = true; set it and re-run, or " +
+                 "delete them by hand.")
+} else if (!DRY_RUN) {
+  log("OK", s"no nested '$PARTITION_KEY=' directory left anywhere under the table root")
+}
+
 if (remainingWrappers.isEmpty) {
   log("OK", "no non-canonical first-level partition directory left under the table root")
 } else {
@@ -808,6 +877,7 @@ println(s"wrappers found        : ${plans.length}")
 println(s"  by RENAME           : ${if (DRY_RUN) planCount("rename") else cRename}")
 println(s"  by MERGE            : ${if (DRY_RUN) planCount("merge") else cMerge}")
 println(s"  empty nested dropped: ${if (DRY_RUN) planCount("drop_empty") else cDropEmpty}")
+println(s"  marker-only dropped : ${if (DRY_RUN) planCount("drop_markers") else cMarkerDirsDeleted}")
 println(s"files moved           : $cFilesMoved")
 println(s"wrappers deleted      : $cWrappersDeleted")
 println(s"failures              : $cFailed")

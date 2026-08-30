@@ -70,7 +70,7 @@ resulting tree and metastore.
 
 | Cell | Checks |
 |---|---|
-| flatten | dry run changes nothing; `runId=X/runid=X` collapses to `runId=X` in one pass and the metastore is re-pointed; second apply is a no-op; a UUID mismatch is skipped, never merged; a name collision on merge keeps both files; markers stay put and their dir survives; `DELETE_MARKERS_ON_MERGE=true` clears it |
+| flatten | dry run changes nothing; `runId=X/runid=X` collapses to `runId=X` in one pass and the metastore is re-pointed; second apply is a no-op; a UUID mismatch is skipped, never merged; a name collision on merge keeps both files; markers stay put and their dir survives; `DELETE_MARKERS_ON_MERGE=true` clears it; a marker-only nested dir is left and named by default, removed with the flag, and never dropped if data appeared in it; a leftover is cleared by a re-run with the flag on; a surviving nested dir is named in the report |
 | rename | `runid=X` becomes `runId=X` and is re-pointed; a still-nested dir is refused; `MERGE_ON_COLLISION=false` refuses a colliding target; `MERGE_ON_COLLISION=true` loses no file, colliding or not |
 | recreate | dry run touches nothing; `alter` mode refuses to execute and leaves the table alone; `recreate` mode really lands `runId` in Spark's schema; aborts on MANAGED; aborts once, with diagnostics, on an invisible table; the backup replays the pre-drop definition; every partition is re-registered, not just the first; a nested `array<array<double>>` column survives |
 
@@ -79,6 +79,24 @@ four plain strings the other fixtures use. Production carries `matrix
 array<array<double>>`, and `recreate` rebuilds the table from a schema JSON in
 which a nested type has to be a nested JSON object, not the DDL string. It is
 the one column shape whose failure would land *after* the `DROP`.
+
+### The leftover `runid=` directory
+
+A nested `runid=` dir can outlive a flatten in two ways, and both are covered:
+
+- it held data **and** a marker, so the data was promoted but `_SUCCESS` kept
+  the directory alive (`DELETE_MARKERS_ON_MERGE` is `false` by default);
+- it held **only** markers, so the merge path never ran at all.
+
+The second used to be reported as "remove manually" and the first was not
+reported at all -- the validation scan only looked at *first-level* dirs with a
+non-canonical key, so `runId=X/runid=X` was invisible to it and the run read as
+a clean success. The validation now re-scans the final tree for any nested
+`runId=` dir and names what it holds, and `DELETE_MARKERS_ON_MERGE = true`
+removes marker-only dirs as well as markers on a merge. That branch is the only
+one that deletes a non-empty directory, so it re-lists the directory
+immediately before deleting and abandons the delete if anything that is not a
+marker has appeared.
 
 The merge tests are the ones that matter most, because merging is the only
 place the cells can lose data: files are moved into a directory that already
@@ -94,7 +112,7 @@ The local filesystem stands in for HDFS. That is faithful for what the cells do
 
 ## Environment notes (Windows)
 
-All 19 tests run on Windows. Two things had to be arranged for that, both
+All 24 tests run on Windows. Two things had to be arranged for that, both
 handled automatically:
 
 **Case sensitivity.** Telling `runId=` from `runid=` is the entire point, and
