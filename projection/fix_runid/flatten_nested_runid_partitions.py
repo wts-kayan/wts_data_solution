@@ -69,7 +69,7 @@ import uuid as _uuid
 # 1. CONFIG
 # ---------------------------------------------------------------------
 
-TABLE_ROOT = "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
+TABLE_ROOT = "/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
 DRY_RUN    = True          # must stay True until the plan has been reviewed
 HIVE_TABLE = "dbprojection.term_structure"
 EMIT_HIVE_DDL = True
@@ -82,7 +82,7 @@ PARTITION_KEY = "runid"
 # (hdfs://..., file:/...). Set to None to skip the file and only print.
 # NOTE: this file is written in dry-run too -- it is the review artefact.
 # It lives outside TABLE_ROOT, so the table itself stays untouched in dry-run.
-DDL_OUTPUT_PATH = "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/tmp/generated_partition_ddl.sql"
+DDL_OUTPUT_PATH = "/Projects/STCreditRisk_UAT/tmp/generated_partition_ddl.sql"
 
 # A merge (target partition already exists) never moves _SUCCESS / _temporary
 # / .hive-staging* / dot-files: they are listed in the report and left in

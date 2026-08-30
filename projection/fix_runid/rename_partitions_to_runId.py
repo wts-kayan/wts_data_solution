@@ -61,7 +61,7 @@ import uuid as _uuid
 # 1. CONFIG
 # ---------------------------------------------------------------------
 
-TABLE_ROOT = "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
+TABLE_ROOT = "/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
 DRY_RUN    = True          # must stay True until the plan has been reviewed
 HIVE_TABLE = "dbprojection.term_structure"
 EMIT_HIVE_DDL = True
@@ -71,7 +71,7 @@ EMIT_HIVE_DDL = True
 TARGET_KEY  = "runId"
 CATALOG_KEY = "runid"
 
-DDL_OUTPUT_PATH = "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/tmp/generated_rename_partition_ddl.sql"
+DDL_OUTPUT_PATH = "/Projects/STCreditRisk_UAT/tmp/generated_rename_partition_ddl.sql"
 
 # When both runid=<X> and runId=<X> exist, move the files of the lowercase
 # one into the camelCase one (renaming on collision) instead of skipping.

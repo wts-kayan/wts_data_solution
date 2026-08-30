@@ -54,7 +54,7 @@ import json
 # ---------------------------------------------------------------------
 
 HIVE_TABLE = "dbprojection.term_structure"
-TABLE_ROOT = "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
+TABLE_ROOT = "/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
 DRY_RUN    = True                # must stay True until the DDL is reviewed
 
 FIX_MODE   = "recreate"          # "alter" (safe, in place) | "recreate" (drop + create)
@@ -68,8 +68,8 @@ PARTITION_TYPE = "string"
 # back from the metastore.
 ON_DISK_KEY = "runid"
 
-DDL_OUTPUT_PATH    = "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/tmp/recreate_table_ddl.sql"
-BACKUP_OUTPUT_PATH = "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/tmp/table_definition_backup.sql"
+DDL_OUTPUT_PATH    = "/Projects/STCreditRisk_UAT/tmp/recreate_table_ddl.sql"
+BACKUP_OUTPUT_PATH = "/Projects/STCreditRisk_UAT/tmp/table_definition_backup.sql"
 
 # ---------------------------------------------------------------------
 # 2. Logging helpers

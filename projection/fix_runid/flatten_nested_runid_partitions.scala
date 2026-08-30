@@ -80,7 +80,7 @@ import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 // ---------------------------------------------------------------------
 
 val TABLE_ROOT =
-  "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
+  "/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
 val DRY_RUN       = true          // must stay true until the plan has been reviewed
 val HIVE_TABLE    = "dbprojection.term_structure"
 val EMIT_HIVE_DDL = true
@@ -94,7 +94,7 @@ val PARTITION_KEY = "runid"
 // NOTE: this file is written in dry-run too -- it is the review artefact.
 // It lives outside TABLE_ROOT, so the table itself stays untouched in dry-run.
 val DDL_OUTPUT_PATH =
-  "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/tmp/generated_partition_ddl.sql"
+  "/Projects/STCreditRisk_UAT/tmp/generated_partition_ddl.sql"
 
 // A merge (target partition already exists) never moves _SUCCESS / _temporary
 // / .hive-staging* / dot-files: they are listed in the report and left in

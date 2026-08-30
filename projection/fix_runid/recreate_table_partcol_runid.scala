@@ -67,7 +67,7 @@ import org.apache.spark.sql.types.{DataType, StringType, StructField, StructType
 
 val HIVE_TABLE = "dbprojection.term_structure"
 val TABLE_ROOT =
-  "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
+  "/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
 val DRY_RUN = true                // must stay true until the DDL is reviewed
 
 val FIX_MODE = "recreate"         // "alter" (safe, in place) | "recreate" (drop + create)
@@ -80,9 +80,9 @@ val PARTITION_TYPE = "string"
 val ON_DISK_KEY = "runid"
 
 val DDL_OUTPUT_PATH =
-  "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/tmp/recreate_table_ddl.sql"
+  "/Projects/STCreditRisk_UAT/tmp/recreate_table_ddl.sql"
 val BACKUP_OUTPUT_PATH =
-  "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/tmp/table_definition_backup.sql"
+  "/Projects/STCreditRisk_UAT/tmp/table_definition_backup.sql"
 
 // ---------------------------------------------------------------------
 // 2. Logging helpers
