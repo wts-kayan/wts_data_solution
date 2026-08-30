@@ -1178,6 +1178,30 @@ object CellTests {
                   spark.table(s"$db.t_nested").schema.fieldNames.contains("runId"))
     }
 
+    // The nested check lives on phase 1's result, so turning phase 1 OFF used
+    // to take the guard with it: phase 2 would then recreate a nested table
+    // and register its partitions at runId=<X> while the data sits one level
+    // deeper, at runId=<X>/runid=<X>. Nothing is deleted, but the partition
+    // reads empty.
+    check("DO_RENAME=false still refuses to recreate a nested table") {
+      val db = "fixall_norename"
+      makeDb(db)
+      val root = runidTable(db, "t_nested", Seq("aaa1"))
+      val inner = root.resolve("runid=aaa1").resolve("runid=aaa1")
+      Files.createDirectories(inner)
+      val st = Files.list(root.resolve("runid=aaa1"))
+      val moved = try st.iterator().asScala.filter(Files.isRegularFile(_)).toVector
+                  finally st.close()
+      moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
+      val out = Files.createTempDirectory("fixall-norename-")
+      generated.FixAllCell.run(spark, Map(
+        "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false",
+        "DO_RENAME" -> "false", "DO_RECREATE" -> "true"))
+      assertFalse("a nested table must not be recreated even with phase 1 off",
+                  spark.table(s"$db.t_nested").schema.fieldNames.contains("runId"))
+      assertTrue("and its data must still be where it was", Files.exists(inner))
+    }
+
     check("a second run is a clean no-op") {
       if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
       val db = "fixall_idem"

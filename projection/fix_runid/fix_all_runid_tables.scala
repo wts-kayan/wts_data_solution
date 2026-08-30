@@ -293,6 +293,11 @@ if (outOf.nonEmpty) {
   outOf.foreach { case (t, why) => println(f"  $t%-46s $why") }
 }
 
+val unknownOnly = onlyFilter.diff(allTables.toSet)
+if (unknownOnly.nonEmpty)
+  log("WARN", s"ONLY_TABLES names ${unknownOnly.size} table(s) that do not exist in $DB: " +
+              unknownOnly.toSeq.sorted.mkString(", ") + " - check for a typo")
+
 if (targets.isEmpty)
   log("WARN", s"no table in $DB is partitioned by '$HIVE_PARTITION_COL' - nothing to do")
 
@@ -303,6 +308,27 @@ if (targets.isEmpty)
 case class RenameResult(renamed: Int, merged: Int, filesMoved: Int, dirsDeleted: Int,
                         repointed: Int, failed: Int, skipped: Seq[(String, String)],
                         nested: Seq[String])
+
+/** Every `<key>=<X>/<key>=<Y>` nesting under the table root, read fresh from
+  * disk. Phase 2 must never run against one of these: it registers partitions
+  * at <root>/runId=<X> while the data sits a level deeper, so the partition
+  * would read empty. Deliberately NOT derived from phase 1's result -- phase 1
+  * can be turned off, and the guard has to survive that. */
+def nestedDirsOf(t: Target): Seq[String] = {
+  Try {
+    val fs   = FileSystem.get(new URI(t.location), conf)
+    val root = new Path(t.location)
+    if (!fs.exists(root)) Seq.empty[String]
+    else ls(fs, root).filter(st => st.isDirectory && !isProtected(st.getPath.getName))
+      .filter(st => splitKey(st.getPath.getName)._1.toLowerCase == HIVE_PARTITION_COL)
+      .flatMap { st =>
+        ls(fs, st.getPath)
+          .filter(c => c.isDirectory &&
+                       splitKey(c.getPath.getName)._1.toLowerCase == HIVE_PARTITION_COL)
+          .map(_.getPath.toString)
+      }.toSeq
+  }.getOrElse(Seq.empty[String])
+}
 
 case class RPlan(var kind: String, src: Path, target: Path, value: String,
                  files: Int, bytes: Long, protectedNames: Seq[String])
@@ -491,7 +517,11 @@ def renameOneTable(t: Target): RenameResult = {
 // 6. Phase 2 -- recreate so Spark's partCol.0 carries the camelCase
 // ---------------------------------------------------------------------
 
-case class RecreateResult(done: Boolean, why: String, partitions: Int)
+/** `failed` separates a refusal that needs attention (no backup, unreadable
+  * schema, a DROP that did not work) from a legitimate skip (already correct,
+  * or a dry run). Both leave `done` false, but only one is a problem. */
+case class RecreateResult(done: Boolean, why: String, partitions: Int,
+                          failed: Boolean = false)
 
 // Properties Spark/Hive regenerate on their own -- never replay them.
 val VOLATILE = Set("transient_lastDdlTime", "totalSize", "numFiles", "numRows",
@@ -503,26 +533,28 @@ def recreateOneTable(t: Target): RecreateResult = {
 
   val meta = Try(spark.sessionState.catalog
                       .getTableMetadata(TableIdentifier(t.name, Some(DB)))).toOption
-  if (meta.isEmpty) return RecreateResult(false, "table not readable from the catalog", 0)
+  if (meta.isEmpty) return RecreateResult(false, "table not readable from the catalog", 0, failed = true)
   val m = meta.get
 
   // The guards, re-evaluated here rather than trusted from discovery: phase 1
   // ran in between.
   if (m.tableType == CatalogTableType.MANAGED)
-    return RecreateResult(false, "MANAGED - DROP would delete the data", 0)
+    return RecreateResult(false, "MANAGED - DROP would delete the data", 0, failed = true)
   if (m.properties.getOrElse("external.table.purge", "").trim.toLowerCase == "true")
-    return RecreateResult(false, "external.table.purge=true - DROP would delete the data", 0)
+    return RecreateResult(false, "external.table.purge=true - DROP would delete the data", 0,
+                          failed = true)
 
   val location = m.storage.locationUri.map(_.toString).getOrElse("")
   if (location.trim.isEmpty)
-    return RecreateResult(false, "no location - refusing to recreate blind", 0)
+    return RecreateResult(false, "no location - refusing to recreate blind", 0, failed = true)
 
   // --- schema, in Spark's own JSON form ------------------------------
   var schemaJson: String = null
   Try { schemaJson = spark.table(fq).schema.json }
     .failed.foreach(e => log("WARN", s"$fq : schema via spark.table failed: ${e.getMessage}"))
   if (schemaJson == null)
-    return RecreateResult(false, "the schema could not be captured in Spark's JSON form", 0)
+    return RecreateResult(false, "the schema could not be captured in Spark's JSON form", 0,
+                          failed = true)
 
   // The partition column must be present, and carry PARTITION_COL's casing.
   var st = DataType.fromJson(schemaJson).asInstanceOf[StructType]
@@ -536,7 +568,7 @@ def recreateOneTable(t: Target): RecreateResult = {
   val dataFields = st.fields.filter(_.name.toLowerCase != HIVE_PARTITION_COL)
   if (dataFields.isEmpty)
     return RecreateResult(false, "no data column could be read - recreating from an " +
-                                 "empty schema would destroy the definition", 0)
+                                 "empty schema would destroy the definition", 0, failed = true)
 
   // Already correct? Then this table is a no-op rather than a needless drop.
   val currentPartCol = m.properties.getOrElse("spark.sql.sources.schema.partCol.0", "")
@@ -566,7 +598,7 @@ def recreateOneTable(t: Target): RecreateResult = {
 
   if (partitions.isEmpty)
     return RecreateResult(false, "no partition could be captured - dropping now would " +
-                                 "lose every partition registration", 0)
+                                 "lose every partition registration", 0, failed = true)
 
   // --- the DDL --------------------------------------------------------
   val colsDdl = dataFields.map(f => s"  `${f.name}` ${f.dataType.sql}").mkString(",\n")
@@ -608,13 +640,14 @@ def recreateOneTable(t: Target): RecreateResult = {
 
   if (!backupOk)
     return RecreateResult(false, "the backup could not be written - refusing to DROP " +
-                                 "without a replayable backup", partitions.length)
+                                 "without a replayable backup", partitions.length,
+                          failed = true)
 
   var ok = true
   Try(spark.sql(s"DROP TABLE IF EXISTS $fq"))
     .failed.foreach { e => ok = false; log("ERROR", s"$fq : DROP failed: ${e.getMessage}") }
   if (!ok) return RecreateResult(false, "DROP failed - the table is untouched",
-                                 partitions.length)
+                                 partitions.length, failed = true)
 
   Try { spark.sql(createSql); log("OK", s"  CREATE $fq") }
     .failed.foreach { e =>
@@ -654,7 +687,6 @@ case class Outcome(table: String, renamed: Int, merged: Int, filesMoved: Int,
                    partitions: Int, failed: Int, nested: Int)
 
 val outcomes = ArrayBuffer[Outcome]()
-val aborted  = ArrayBuffer[String]()
 
 targets.foreach { t =>
   val fq = s"$DB.${t.name}"
@@ -671,20 +703,27 @@ targets.foreach { t =>
     }
   }
 
-  // A table still nested is not ready for phase 2: its partition locations
-  // would be re-registered pointing at the wrong depth.
-  if (!hardFail && ren.nested.nonEmpty) {
-    log("WARN", s"$fq : ${ren.nested.length} nested dir(s) - phase 2 skipped, " +
+  // Read the nesting off DISK, after phase 1 and whether or not phase 1 ran.
+  // A table still nested is not ready for phase 2: its partitions would be
+  // re-registered at <root>/runId=<X> while the data sits a level deeper.
+  val nestedNow = nestedDirsOf(t)
+
+  if (!hardFail && nestedNow.nonEmpty) {
+    log("WARN", s"$fq : ${nestedNow.length} nested dir(s) - phase 2 skipped, " +
                 "run flatten_nested_runid_partitions.scala on this table first")
+    nestedNow.foreach(n => log("WARN", s"  nested: $n"))
     rc = RecreateResult(false, "nested runid= dirs present - flatten it first", 0)
+  } else if (!hardFail && ren.failed > 0) {
+    // Half-fixed on disk. Recreating now would bake that half-state into a new
+    // definition, so it waits for a clean phase 1.
+    log("WARN", s"$fq : phase 1 had ${ren.failed} failure(s) - phase 2 skipped, " +
+                "fix those and re-run")
+    rc = RecreateResult(false, s"phase 1 had ${ren.failed} failure(s) - not recreated", 0)
   } else if (!hardFail && DO_RECREATE) {
     Try(rc = recreateOneTable(t)).failed.foreach { e =>
       // sys.error from inside recreateOneTable is the catastrophic case and
       // must not be swallowed: re-throw it and stop the batch.
-      if (String.valueOf(e.getMessage).startsWith("ABORT:")) {
-        aborted += String.valueOf(e.getMessage)
-        throw e
-      }
+      if (String.valueOf(e.getMessage).startsWith("ABORT:")) throw e
       hardFail = true
       log("ERROR", s"$fq : phase 2 failed: ${e.getMessage}")
     }
@@ -692,9 +731,10 @@ targets.foreach { t =>
 
   outcomes += Outcome(t.name, ren.renamed, ren.merged, ren.filesMoved, ren.repointed,
                       rc.done, rc.why, rc.partitions,
-                      ren.failed + (if (hardFail) 1 else 0), ren.nested.length)
+                      ren.failed + (if (hardFail) 1 else 0) + (if (rc.failed) 1 else 0),
+                      nestedNow.length)
 
-  if (STOP_ON_FAILURE && (hardFail || ren.failed > 0))
+  if (STOP_ON_FAILURE && (hardFail || ren.failed > 0 || rc.failed))
     sys.error(s"ABORT: $fq failed and STOP_ON_FAILURE=true. " +
               s"${outcomes.length} table(s) had been processed.")
 }
