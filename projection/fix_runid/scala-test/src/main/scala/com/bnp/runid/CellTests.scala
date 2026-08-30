@@ -389,6 +389,35 @@ object CellTests {
       .getTableMetadata(new org.apache.spark.sql.catalyst.TableIdentifier(t, Some(db)))
       .properties.getOrElse("external.table.purge", "")
 
+  /** EXTERNAL, partitioned by `runid`, with the partition directories still
+    * in the WRONG case on disk -- the state the batch cell exists to fix. */
+  private def runidTable(db: String, t: String, values: Seq[String]): JPath = {
+    val root = newRoot(s"fixall-$t-")
+    values.foreach(v => writeOrcPartition(root, "runid", v, 1))
+    spark.sql(s"DROP TABLE IF EXISTS $db.$t")
+    spark.sql(
+      s"""CREATE EXTERNAL TABLE $db.$t (
+         |  `matrixMigrationName` string,
+         |  `asOfDate` string,
+         |  `scenario` string,
+         |  `notationCode` string)
+         |PARTITIONED BY (`runid` string)
+         |STORED AS ORC
+         |LOCATION '${uri(root)}'""".stripMargin)
+    values.foreach(v =>
+      spark.sql(s"ALTER TABLE $db.$t ADD IF NOT EXISTS PARTITION (runid='$v') " +
+                s"LOCATION '${uri(root)}/runid=$v'"))
+    root
+  }
+
+  /** Directory names directly under a table root, sorted. */
+  private def dirNames(root: JPath): Seq[String] = {
+    val st = Files.list(root)
+    try st.iterator().asScala.filter(Files.isDirectory(_))
+         .map(_.getFileName.toString).toVector.sorted
+    finally st.close()
+  }
+
   private def readArtifact(dir: JPath, name: String): String =
     new String(Files.readAllBytes(dir.resolve(name)), "UTF-8")
 
@@ -1056,6 +1085,169 @@ object CellTests {
     }
   }
 
+  private def fixAllTests(): Unit = {
+    println("")
+    println("fix_all_runid_tables.scala")
+
+    def cfg(db: String, out: JPath, dry: Boolean) = Map(
+      "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString,
+      "DRY_RUN" -> dry.toString)
+
+    check("only tables partitioned by runid are in scope") {
+      val db = "fixall_scope"
+      makeDb(db)
+      val hit = runidTable(db, "in_scope", Seq("aaa1"))
+      extPlainTable(db, "no_parts")
+      spark.sql(s"DROP TABLE IF EXISTS $db.other_key")
+      spark.sql(s"CREATE EXTERNAL TABLE $db.other_key (a string) " +
+                s"PARTITIONED BY (asofdate string) STORED AS ORC " +
+                s"LOCATION '${uri(newRoot("fixall-otherkey-"))}'")
+      spark.sql(s"DROP TABLE IF EXISTS $db.man_one")
+      spark.sql(s"CREATE TABLE $db.man_one (a string) PARTITIONED BY (runid string) " +
+                "STORED AS ORC")
+      val out = Files.createTempDirectory("fixall-scope-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, cfg(db, out, dry = true))
+      }
+      assertTrue("the runid table must be in scope", log.contains("IN SCOPE  " + db + ".in_scope"))
+      assertFalse("a non-partitioned table must not be", log.contains("IN SCOPE  " + db + ".no_parts"))
+      assertFalse("nor one partitioned by another column",
+                  log.contains("IN SCOPE  " + db + ".other_key"))
+      assertFalse("nor a MANAGED one", log.contains("IN SCOPE  " + db + ".man_one"))
+      assertTrue("and the MANAGED one must be named as out of scope",
+                 log.contains("man_one") && log.contains("MANAGED"))
+      assertTrue("the fixture must still be untouched by a dry run",
+                 dirNames(hit) == Seq("runid=aaa1"))
+    }
+
+    check("DRY_RUN renames nothing and recreates nothing") {
+      val db = "fixall_dry"
+      makeDb(db)
+      val root = runidTable(db, "t_one", Seq("aaa1", "bbb2"))
+      val before = tree(root)
+      val out = Files.createTempDirectory("fixall-dry-")
+      generated.FixAllCell.run(spark, cfg(db, out, dry = true))
+      assertEquals("the tree must be untouched", before, tree(root))
+      assertFalse("and Spark must not yet carry the camelCase",
+                  spark.table(s"$db.t_one").schema.fieldNames.contains("runId"))
+    }
+
+    check("both phases run, over every in-scope table") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_apply"
+      makeDb(db)
+      val r1 = runidTable(db, "t_one", Seq("aaa1", "bbb2"))
+      val r2 = runidTable(db, "t_two", Seq("ccc3"))
+      val out = Files.createTempDirectory("fixall-apply-")
+      generated.FixAllCell.run(spark, cfg(db, out, dry = false))
+
+      Seq(("t_one", r1, Seq("runId=aaa1", "runId=bbb2")),
+          ("t_two", r2, Seq("runId=ccc3"))).foreach { case (t, root, want) =>
+        assertEquals(s"$t : every dir must be re-cased on disk", want, dirNames(root))
+        val cols = spark.table(s"$db.$t").schema.fieldNames
+        assertTrue(s"$t : Spark's schema must carry runId, got " + cols.mkString(","),
+                   cols.contains("runId"))
+        assertEquals(s"$t : every partition must be registered",
+                     want.length.toLong, spark.sql(s"SHOW PARTITIONS $db.$t").count())
+        assertEquals(s"$t : the rows must still read back",
+                     want.length.toLong, spark.table(s"$db.$t").count())
+      }
+    }
+
+    check("a nested table is skipped by both phases and reported") {
+      val db = "fixall_nested"
+      makeDb(db)
+      val root = runidTable(db, "t_nested", Seq("aaa1"))
+      // turn runid=aaa1 into the double-nested defect
+      val inner = root.resolve("runid=aaa1").resolve("runid=aaa1")
+      Files.createDirectories(inner)
+      val st = Files.list(root.resolve("runid=aaa1"))
+      val moved = try st.iterator().asScala.filter(Files.isRegularFile(_)).toVector
+                  finally st.close()
+      moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
+      val out = Files.createTempDirectory("fixall-nested-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, cfg(db, out, dry = false))
+      }
+      assertTrue("the nested dir must be left alone", Files.exists(inner))
+      assertTrue("the run must say to flatten it first",
+                 log.contains("flatten_nested_runid_partitions.scala"))
+      assertTrue("and must list the table as still nested",
+                 log.contains("STILL NESTED"))
+      assertFalse("phase 2 must not have recreated it",
+                  spark.table(s"$db.t_nested").schema.fieldNames.contains("runId"))
+    }
+
+    check("a second run is a clean no-op") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_idem"
+      makeDb(db)
+      val root = runidTable(db, "t_one", Seq("aaa1"))
+      val out = Files.createTempDirectory("fixall-idem-")
+      generated.FixAllCell.run(spark, cfg(db, out, dry = false))
+      val afterFirst = tree(root)
+      generated.FixAllCell.run(spark, cfg(db, out, dry = false))
+      assertEquals("the second run must change nothing on disk", afterFirst, tree(root))
+      assertTrue("and must leave Spark's schema correct",
+                 spark.table(s"$db.t_one").schema.fieldNames.contains("runId"))
+      assertEquals("with the partition still registered", 1L,
+                   spark.sql(s"SHOW PARTITIONS $db.t_one").count())
+    }
+
+    check("ONLY_TABLES limits the batch to the named tables") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_only"
+      makeDb(db)
+      val r1 = runidTable(db, "t_one", Seq("aaa1"))
+      val r2 = runidTable(db, "t_two", Seq("bbb2"))
+      val out = Files.createTempDirectory("fixall-only-")
+      generated.FixAllCell.run(spark,
+        cfg(db, out, dry = false) + ("ONLY_TABLES" -> "t_one"))
+      assertEquals("the named table must be fixed", Seq("runId=aaa1"), dirNames(r1))
+      assertEquals("the other must be untouched", Seq("runid=bbb2"), dirNames(r2))
+    }
+
+    // The batch duplicates the two single-table algorithms, so the thing worth
+    // pinning is that it still lands in the SAME state they do.
+    check("the batch lands where the two single-table cells land") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_equiv"
+      makeDb(db)
+      val batchRoot  = runidTable(db, "t_batch", Seq("aaa1", "bbb2"))
+      val singleRoot = runidTable(db, "t_single", Seq("aaa1", "bbb2"))
+
+      val out = Files.createTempDirectory("fixall-equiv-")
+      generated.FixAllCell.run(spark,
+        cfg(db, out, dry = false) + ("ONLY_TABLES" -> "t_batch"))
+
+      generated.RenameCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(singleRoot), "HIVE_TABLE" -> s"$db.t_single",
+        "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> (uri(out) + "/single-rename.sql")))
+      generated.RecreateCell.run(spark, Map(
+        "HIVE_TABLE" -> s"$db.t_single", "TABLE_ROOT" -> uri(singleRoot),
+        "DRY_RUN" -> "false", "FIX_MODE" -> "recreate",
+        "DDL_OUTPUT_PATH" -> (uri(out) + "/single-recreate.sql"),
+        "BACKUP_OUTPUT_PATH" -> (uri(out) + "/single-backup.sql")))
+
+      assertEquals("the on-disk layout must match",
+                   dirNames(singleRoot), dirNames(batchRoot))
+      // Spark names each ORC file part-<random uuid>, so the two fixtures can
+      // never share file NAMES. What must match is the shape: which directory
+      // each file ends up in, and how many.
+      def shape(root: JPath) = tree(root).map(_.replaceAll("part-[^/]*$", "part-*"))
+      assertEquals("the file layout must match", shape(singleRoot), shape(batchRoot))
+      assertEquals("Spark's schema must match",
+                   spark.table(s"$db.t_single").schema.fieldNames.toSeq,
+                   spark.table(s"$db.t_batch").schema.fieldNames.toSeq)
+      assertEquals("the partition count must match",
+                   spark.sql(s"SHOW PARTITIONS $db.t_single").count(),
+                   spark.sql(s"SHOW PARTITIONS $db.t_batch").count())
+      assertEquals("and the rows must match",
+                   spark.table(s"$db.t_single").count(),
+                   spark.table(s"$db.t_batch").count())
+    }
+  }
+
   // ------------------------------------------------------------------
 
   def main(args: Array[String]): Unit = {
@@ -1069,6 +1261,7 @@ object CellTests {
       flattenTests()
       renameTests()
       recreateTests()
+      fixAllTests()
       dropTablesTests()
     } finally {
       if (spark != null) spark.stop()

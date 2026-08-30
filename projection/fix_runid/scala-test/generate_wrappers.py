@@ -41,6 +41,7 @@ CELLS = {
     "fix_runid/flatten_nested_runid_partitions.scala": "FlattenCell",
     "fix_runid/rename_partitions_to_runId.scala": "RenameCell",
     "fix_runid/recreate_table_partcol_runid.scala": "RecreateCell",
+    "fix_runid/fix_all_runid_tables.scala": "FixAllCell",
     "fix_droptables/unpurge_and_drop_dbprojection.scala": "UnpurgeDropCell",
 }
 
