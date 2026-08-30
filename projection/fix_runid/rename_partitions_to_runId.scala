@@ -72,7 +72,7 @@ import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 // ---------------------------------------------------------------------
 
 val TABLE_ROOT =
-  "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
+  "/Projects/STCreditRisk_UAT/hive/databases/dbprojection.db/term_structure"
 val DRY_RUN       = true          // must stay true until the plan has been reviewed
 val HIVE_TABLE    = "dbprojection.term_structure"
 val EMIT_HIVE_DDL = true
@@ -83,7 +83,7 @@ val TARGET_KEY  = "runId"
 val CATALOG_KEY = "runid"
 
 val DDL_OUTPUT_PATH =
-  "hdfs://hahdfsnameservice/Projects/STCreditRisk_UAT/tmp/generated_rename_partition_ddl.sql"
+  "/Projects/STCreditRisk_UAT/tmp/generated_rename_partition_ddl.sql"
 
 // When both runid=<X> and runId=<X> exist, move the files of the lowercase
 // one into the camelCase one (renaming on collision) instead of skipping.
