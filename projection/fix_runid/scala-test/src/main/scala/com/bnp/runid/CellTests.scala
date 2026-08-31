@@ -1713,6 +1713,84 @@ object CellTests {
       assertEquals("the tree must be untouched", before, tree(root))
     }
 
+    // The dry run has to predict the apply. Phase F only PLANS in a dry run, so
+    // the nesting is still on disk when phase 1 scans -- and the run used to
+    // report it as refused and the table as STILL NESTED, none of which an
+    // apply would do. That is the report an operator reads before deciding.
+    check("a dry run does not report a nesting phase F will remove") {
+      val db = "fixall_drypredict"
+      makeDb(db)
+      val root = runidTable(db, "t_nest", Seq("aaa1"))
+      // runId=aaa1/runid=aaa1 -- same run id, so phase F flattens it on apply
+      val outer = root.resolve("runId=aaa1")
+      val inner = outer.resolve("runid=aaa1")
+      Files.createDirectories(inner)
+      val st = Files.list(root.resolve("runid=aaa1"))
+      val moved = try st.iterator().asScala.filter(Files.isRegularFile(_)).toVector
+                  finally st.close()
+      moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
+      Files.delete(root.resolve("runid=aaa1"))
+
+      val out = Files.createTempDirectory("fixall-drypredict-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "true"))
+      }
+      assertTrue("phase F must plan to clear it",
+                 log.contains("PROMOTE") && log.contains("then DELETE it"))
+      assertFalse("the dry run must not claim the table is still nested",
+                  log.contains("STILL NESTED"))
+      assertFalse("nor that phase F refused anything",
+                  log.contains("phase F refused"))
+      assertFalse("nor tell phase 1 to skip it as still-nested",
+                  log.contains("Renaming the wrapper would only move the nesting"))
+    }
+
+    // The prediction has to be right, not merely quiet: applying the same
+    // fixture must land where the dry run implied.
+    check("and the apply then lands where that dry run implied") {
+      val db = "fixall_dryapply"
+      makeDb(db)
+      val root = runidTable(db, "t_nest", Seq("aaa1"))
+      val outer = root.resolve("runId=aaa1")
+      val inner = outer.resolve("runid=aaa1")
+      Files.createDirectories(inner)
+      val st = Files.list(root.resolve("runid=aaa1"))
+      val moved = try st.iterator().asScala.filter(Files.isRegularFile(_)).toVector
+                  finally st.close()
+      moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
+      Files.delete(root.resolve("runid=aaa1"))
+
+      val out = Files.createTempDirectory("fixall-dryapply-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      }
+      assertFalse("the nesting must be gone", Files.exists(inner))
+      assertFalse("and the apply must not report it as still nested",
+                  log.contains("STILL NESTED"))
+      assertEquals("with the data promoted, not lost", 1,
+                   tree(root).count(_.endsWith(".orc")))
+      assertTrue("and Spark's schema fixed",
+                 spark.table(s"$db.t_nest").schema.fieldNames.contains("runId"))
+    }
+
+    // A nesting phase F really WOULD refuse must still show up in a dry run --
+    // the fix must not silence the cases that need a human.
+    check("a dry run still reports a nesting phase F would refuse") {
+      val db = "fixall_dryrefuse"
+      makeDb(db)
+      val root = runidTable(db, "t_mm", Seq("aaa1"))
+      writeOrcPartition(root.resolve("runid=aaa1"), "runid", "zzz9", 1)
+      val out = Files.createTempDirectory("fixall-dryrefuse-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "true"))
+      }
+      assertTrue("the refusal must be reported", log.contains("UUID MISMATCH"))
+      assertTrue("and the table listed as still nested", log.contains("STILL NESTED"))
+    }
+
     check("a second run is a clean no-op") {
       if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
       val db = "fixall_idem"

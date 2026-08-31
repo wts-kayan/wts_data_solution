@@ -472,7 +472,11 @@ def ensurePurgeFalse(t: Target): Boolean = {
 //     be running.
 // ---------------------------------------------------------------------
 
-case class FlattenResult(promoted: Int, dirsDeleted: Int,
+/** `planned` is what phase F WOULD remove, and is only ever populated in a dry
+  * run -- in a real run those directories are gone, so there is nothing to
+  * remember. Everything downstream has to treat them as already gone, or a dry
+  * run reports leftovers that an apply would never leave. */
+case class FlattenResult(promoted: Int, dirsDeleted: Int, planned: Seq[String],
                          refused: Seq[(String, String)], failed: Int)
 
 def flattenOneTable(t: Target): FlattenResult = {
@@ -480,7 +484,8 @@ def flattenOneTable(t: Target): FlattenResult = {
   val fs = FileSystem.get(new URI(t.location), conf)
   val root = new Path(t.location)
   if (!fs.exists(root))
-    return FlattenResult(0, 0, Seq((t.location, "table root does not exist")), 1)
+    return FlattenResult(0, 0, Seq.empty,
+                         Seq((t.location, "table root does not exist")), 1)
 
   /** Every non-protected FILE under `dir`, at any depth. */
   def filesUnder(dir: Path): Seq[org.apache.hadoop.fs.FileStatus] = {
@@ -497,6 +502,7 @@ def flattenOneTable(t: Target): FlattenResult = {
   var deleted  = 0
   var failed   = 0
   val refused  = ArrayBuffer[(String, String)]()
+  val planned  = ArrayBuffer[String]()
 
   val partitionDirs = ls(fs, root).filter { st =>
     st.isDirectory && !isProtected(st.getPath.getName) &&
@@ -525,6 +531,7 @@ def flattenOneTable(t: Target): FlattenResult = {
         val bytes = data.map(_.getLen).sum
         log("PLAN", s"  PROMOTE ${data.length} file(s) (${human(bytes)}) out of $subPath, " +
                     "then DELETE it")
+        planned += subPath.toString
         if (!DRY_RUN) {
           var ok = true
           data.foreach { st =>
@@ -564,7 +571,9 @@ def flattenOneTable(t: Target): FlattenResult = {
   refused.foreach { case (sp, why) => log("WARN", s"  KEPT $sp : $why") }
 
   if (!DRY_RUN && (promoted > 0 || deleted > 0)) Try(spark.catalog.refreshByPath(t.location))
-  FlattenResult(promoted, deleted, refused.toSeq, failed)
+  // Only a dry run needs the list: after a real one the directories are gone.
+  FlattenResult(promoted, deleted, if (DRY_RUN) planned.toSeq else Seq.empty,
+                refused.toSeq, failed)
 }
 
 // ---------------------------------------------------------------------
@@ -580,7 +589,7 @@ case class RenameResult(renamed: Int, merged: Int, filesMoved: Int, dirsDeleted:
   * at <root>/runId=<X> while the data sits a level deeper, so the partition
   * would read empty. Deliberately NOT derived from phase 1's result -- phase 1
   * can be turned off, and the guard has to survive that. */
-def nestedDirsOf(t: Target): Seq[String] = {
+def nestedDirsOf(t: Target, alreadyHandled: Set[String] = Set.empty): Seq[String] = {
   Try {
     val fs   = FileSystem.get(new URI(t.location), conf)
     val root = new Path(t.location)
@@ -592,14 +601,14 @@ def nestedDirsOf(t: Target): Seq[String] = {
           .filter(c => c.isDirectory &&
                        splitKey(c.getPath.getName)._1.toLowerCase == HIVE_PARTITION_COL)
           .map(_.getPath.toString)
-      }.toSeq
+      }.toSeq.filterNot(alreadyHandled.contains)
   }.getOrElse(Seq.empty[String])
 }
 
 case class RPlan(var kind: String, src: Path, target: Path, value: String,
                  files: Int, bytes: Long, protectedNames: Seq[String])
 
-def renameOneTable(t: Target): RenameResult = {
+def renameOneTable(t: Target, alreadyHandled: Set[String] = Set.empty): RenameResult = {
   val fq         = s"$DB.${t.name}"
   val tableRoot  = t.location
   val fs         = FileSystem.get(new URI(tableRoot), conf)
@@ -632,8 +641,12 @@ def renameOneTable(t: Target): RenameResult = {
         val value     = valueOpt.get
         val children  = ls(fs, st.getPath)
         val childDirs = children.filter(c => c.isDirectory && !isProtected(c.getPath.getName))
+        // A nesting phase F has planned to remove is treated as gone: in a real
+        // run it already would be, and reporting it here would make a dry run
+        // predict leftovers that an apply never leaves.
         val nestedDirs = childDirs.filter(c =>
-          splitKey(c.getPath.getName)._1.toLowerCase == HIVE_PARTITION_COL)
+          splitKey(c.getPath.getName)._1.toLowerCase == HIVE_PARTITION_COL &&
+          !alreadyHandled.contains(c.getPath.toString))
 
         if (nestedDirs.nonEmpty) {
           // Renaming a wrapper would only move the broken nesting under a new
@@ -643,9 +656,10 @@ def renameOneTable(t: Target): RenameResult = {
             "after phase F - either phase F refused it (a different run id, or a " +
             "protected dir) or DO_FLATTEN is off. Renaming the wrapper would only move " +
             "the nesting under a new name"))
-        } else if (childDirs.nonEmpty) {
+        } else if (childDirs.exists(c => !alreadyHandled.contains(c.getPath.toString))) {
+          val unexpected = childDirs.filterNot(c => alreadyHandled.contains(c.getPath.toString))
           skipped += ((full, s"contains sub-directories " +
-            s"(${childDirs.map(_.getPath.getName).mkString(", ")}) - unexpected layout"))
+            s"(${unexpected.map(_.getPath.getName).mkString(", ")}) - unexpected layout"))
         } else if (key == PARTITION_COL) {
           already += value
         } else {
@@ -953,6 +967,7 @@ def recreateOneTable(t: Target): RecreateResult = {
 section(s"2/4  PHASE 0+F+1+2 PER TABLE  (mode=$MODE)")
 
 case class Outcome(table: String, promoted: Int, subdirsDeleted: Int,
+                   plannedSubdirs: Int,
                    renamed: Int, merged: Int, filesMoved: Int,
                    repointed: Int, recreated: Boolean, recreateWhy: String,
                    partitions: Int, failed: Int, nested: Int)
@@ -963,7 +978,7 @@ targets.foreach { t =>
   val fq = s"$DB.${t.name}"
   subsection(s"$fq   (${t.tableType}, location ${t.location})")
 
-  var fl  = FlattenResult(0, 0, Seq.empty, 0)
+  var fl  = FlattenResult(0, 0, Seq.empty, Seq.empty, 0)
   var ren = RenameResult(0, 0, 0, 0, 0, 0, Seq.empty, Seq.empty)
   var rc = RecreateResult(false, "DO_RECREATE=false", 0)
   var hardFail = false
@@ -985,8 +1000,12 @@ targets.foreach { t =>
     }
   }
 
+  // What phase F removed, or in a dry run would remove. Downstream must not
+  // report these as leftovers.
+  val handled = fl.planned.toSet
+
   if (!hardFail && DO_RENAME) {
-    Try(ren = renameOneTable(t)).failed.foreach { e =>
+    Try(ren = renameOneTable(t, handled)).failed.foreach { e =>
       hardFail = true
       log("ERROR", s"$fq : phase 1 failed: ${e.getMessage}")
     }
@@ -995,7 +1014,7 @@ targets.foreach { t =>
   // Read the nesting off DISK, after phase 1 and whether or not phase 1 ran.
   // A table still nested is not ready for phase 2: its partitions would be
   // re-registered at <root>/runId=<X> while the data sits a level deeper.
-  val nestedNow = nestedDirsOf(t)
+  val nestedNow = nestedDirsOf(t, handled)
 
   if (!hardFail && nestedNow.nonEmpty) {
     // Phase F has already run by now (unless it is switched off), so a nesting
@@ -1026,7 +1045,7 @@ targets.foreach { t =>
     }
   }
 
-  outcomes += Outcome(t.name, fl.promoted, fl.dirsDeleted,
+  outcomes += Outcome(t.name, fl.promoted, fl.dirsDeleted, fl.planned.length,
                       ren.renamed, ren.merged, ren.filesMoved, ren.repointed,
                       rc.done, rc.why, rc.partitions,
                       ren.failed + fl.failed + (if (hardFail) 1 else 0) +
@@ -1087,7 +1106,9 @@ println(s"out of scope          : ${outOf.length}")
 println(s"phases                : flatten=$DO_FLATTEN rename=$DO_RENAME " +
         s"recreate=$DO_RECREATE")
 println(s"files promoted out of subdirs: ${outcomes.map(_.promoted).sum}")
-println(s"subdirs deleted       : ${outcomes.map(_.subdirsDeleted).sum}")
+println(s"subdirs ${if (DRY_RUN) "to delete    " else "deleted      "} : " +
+        s"${if (DRY_RUN) outcomes.map(_.plannedSubdirs).sum else outcomes.map(_.subdirsDeleted).sum}" +
+        s"${if (DRY_RUN) "  (planned, DRY_RUN)" else ""}")
 println(s"purge flipped to false: $cPurgeFlipped")
 println(s"dirs renamed          : ${outcomes.map(_.renamed).sum}")
 println(s"dirs merged           : ${outcomes.map(_.merged).sum}")
