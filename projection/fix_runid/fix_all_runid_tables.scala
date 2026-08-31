@@ -61,9 +61,20 @@
 //  SCOPE
 //  -----
 //  A table is in scope when it has EXACTLY ONE partition column and that
-//  column is `runid`. Everything else is skipped and reported: no partition
-//  column, a different partition column, more than one, MANAGED, or
-//  external.table.purge=true.
+//  column is `runid`. Everything else is skipped and reported, and NOTHING is
+//  changed on it -- not even its table properties: no partition column, a
+//  different partition column, more than one, or MANAGED.
+//
+//  EXTERNAL.TABLE.PURGE
+//  --------------------
+//  With external.table.purge=true Hive deletes the HDFS data on DROP even for
+//  an EXTERNAL table, and that applies to DROP PARTITION as well as to DROP
+//  TABLE. Phase 1 issues DROP PARTITION and phase 2 issues DROP TABLE, so the
+//  flag is set to false and VERIFIED first, per table, in phase 0. These
+//  tables are TRANSLATED_TO_EXTERNAL with purge=TRUE, so that is the normal
+//  path, not an edge case. A table whose flag cannot be verified false is left
+//  completely alone. The flag is not put back: phase 2 recreates the table
+//  without it, which is both safer and what the drop workflow wants.
 //
 //  A table still carrying the double-nested `runId=<X>/runid=<X>/` defect is
 //  SKIPPED, not guessed at -- run flatten_nested_runid_partitions.scala on
@@ -74,9 +85,10 @@
 //    * DRY_RUN defaults to true;
 //    * per-table isolation: one table failing does not stop the others,
 //      unless STOP_ON_FAILURE = true;
-//    * MANAGED tables are never touched -- DROP would delete their data;
-//    * external.table.purge=true is never touched -- DROP would delete the
-//      data even though the table is EXTERNAL;
+//    * MANAGED tables are never touched -- DROP would delete their data
+//      whatever the purge flag says;
+//    * external.table.purge is forced to false and verified before any DROP,
+//      and a table where that cannot be done is left alone;
 //    * the per-table backup is written BEFORE that table's drop, and a
 //      failure to write it means that table is not dropped;
 //    * if a table is gone after its recreate, the whole batch ABORTS -- the
@@ -270,9 +282,6 @@ allTables.foreach { t =>
           outOf += ((t, s"partitioned by '${parts.head}', not '$HIVE_PARTITION_COL'"))
         else if (meta.tableType == CatalogTableType.MANAGED)
           outOf += ((t, "MANAGED - DROP would delete the data, never touched"))
-        else if (purge.trim.toLowerCase == "true")
-          outOf += ((t, "external.table.purge=true - DROP would delete the data " +
-                        "even though the table is EXTERNAL"))
         else if (loc.trim.isEmpty)
           outOf += ((t, "no location in the catalog - refusing to work blind"))
         else
@@ -302,7 +311,73 @@ if (targets.isEmpty)
   log("WARN", s"no table in $DB is partitioned by '$HIVE_PARTITION_COL' - nothing to do")
 
 // ---------------------------------------------------------------------
-// 5. Phase 1 -- rename runid=<X> to runId=<X>, per table
+// 5. Phase 0 -- make external.table.purge false before ANY drop
+// ---------------------------------------------------------------------
+
+// With external.table.purge=true Hive deletes the HDFS data on DROP even for
+// an EXTERNAL table -- and not only on DROP TABLE. DROP PARTITION takes the
+// partition directory with it too, which phase 1 issues to re-point each
+// partition. So the flag has to come down BEFORE either phase touches the
+// metastore, and be verified as actually down before anything is dropped.
+//
+// These tables are TRANSLATED_TO_EXTERNAL with purge=TRUE, so this is the
+// normal case, not an edge case. A table whose flag cannot be verified false
+// is left completely alone.
+//
+// The flag is NOT put back afterwards: phase 2 recreates the table without it,
+// which is the safer state and what the drop workflow wants anyway.
+
+var cPurgeFlipped = 0
+
+def ensurePurgeFalse(t: Target): Boolean = {
+  val fq = s"$DB.${t.name}"
+
+  def readPurge(): String =
+    Try {
+      Try(spark.sessionState.catalog.refreshTable(TableIdentifier(t.name, Some(DB))))
+      spark.sessionState.catalog.getTableMetadata(TableIdentifier(t.name, Some(DB)))
+           .properties.getOrElse("external.table.purge", "")
+    }.getOrElse("<unreadable>")
+
+  val current = readPurge().trim
+  if (current.isEmpty || current.toLowerCase == "false") {
+    log("OK", s"$fq : external.table.purge is '" +
+              (if (current.isEmpty) "<absent>" else current) + "' -- no flip needed")
+    return true
+  }
+  if (current == "<unreadable>") {
+    log("ERROR", s"$fq : external.table.purge could not be read, so it cannot be ruled " +
+                 "out. Leaving this table completely alone.")
+    return false
+  }
+
+  log("PLAN", s"  ALTER  $fq SET external.table.purge = false  (currently '$current')")
+  if (DRY_RUN) return true
+
+  var ok = true
+  Try(spark.sql(s"ALTER TABLE $fq SET TBLPROPERTIES ('external.table.purge'='false')"))
+    .failed.foreach { e =>
+      ok = false
+      log("ERROR", s"$fq : could not set external.table.purge=false: ${e.getMessage}")
+    }
+  if (!ok) return false
+
+  // Re-read it: the flip is only worth anything if the metastore agrees.
+  val now = readPurge().trim
+  if (now.isEmpty || now.toLowerCase == "false") {
+    cPurgeFlipped += 1
+    log("OK", s"$fq : external.table.purge verified '" +
+              (if (now.isEmpty) "<absent>" else now) + "' -- DROP is now metastore-only")
+    true
+  } else {
+    log("ERROR", s"$fq : external.table.purge still reads '$now' after the ALTER. " +
+                 "Refusing to drop anything on this table -- DROP would delete its data.")
+    false
+  }
+}
+
+// ---------------------------------------------------------------------
+// 6. Phase 1 -- rename runid=<X> to runId=<X>, per table
 // ---------------------------------------------------------------------
 
 case class RenameResult(renamed: Int, merged: Int, filesMoved: Int, dirsDeleted: Int,
@@ -514,7 +589,7 @@ def renameOneTable(t: Target): RenameResult = {
 }
 
 // ---------------------------------------------------------------------
-// 6. Phase 2 -- recreate so Spark's partCol.0 carries the camelCase
+// 7. Phase 2 -- recreate so Spark's partCol.0 carries the camelCase
 // ---------------------------------------------------------------------
 
 /** `failed` separates a refusal that needs attention (no backup, unreadable
@@ -540,9 +615,11 @@ def recreateOneTable(t: Target): RecreateResult = {
   // ran in between.
   if (m.tableType == CatalogTableType.MANAGED)
     return RecreateResult(false, "MANAGED - DROP would delete the data", 0, failed = true)
+  // Re-verified here, not trusted from phase 0: this is the last gate before a
+  // DROP TABLE, and phase 1 ran in between.
   if (m.properties.getOrElse("external.table.purge", "").trim.toLowerCase == "true")
-    return RecreateResult(false, "external.table.purge=true - DROP would delete the data", 0,
-                          failed = true)
+    return RecreateResult(false, "external.table.purge is still true - DROP would delete " +
+                                 "the data", 0, failed = true)
 
   val location = m.storage.locationUri.map(_.toString).getOrElse("")
   if (location.trim.isEmpty)
@@ -677,10 +754,10 @@ def recreateOneTable(t: Target): RecreateResult = {
 }
 
 // ---------------------------------------------------------------------
-// 7. The loop
+// 8. The loop
 // ---------------------------------------------------------------------
 
-section(s"2/4  PHASE 1+2 PER TABLE  (mode=$MODE)")
+section(s"2/4  PHASE 0+1+2 PER TABLE  (mode=$MODE)")
 
 case class Outcome(table: String, renamed: Int, merged: Int, filesMoved: Int,
                    repointed: Int, recreated: Boolean, recreateWhy: String,
@@ -696,7 +773,15 @@ targets.foreach { t =>
   var rc = RecreateResult(false, "DO_RECREATE=false", 0)
   var hardFail = false
 
-  if (DO_RENAME) {
+  // Phase 0 FIRST. Both phases issue a DROP -- phase 1 a DROP PARTITION, phase
+  // 2 a DROP TABLE -- and with purge=true either takes the HDFS data with it.
+  if (!ensurePurgeFalse(t)) {
+    hardFail = true
+    rc = RecreateResult(false, "external.table.purge could not be verified false - " +
+                               "nothing was done to this table", 0, failed = true)
+  }
+
+  if (!hardFail && DO_RENAME) {
     Try(ren = renameOneTable(t)).failed.foreach { e =>
       hardFail = true
       log("ERROR", s"$fq : phase 1 failed: ${e.getMessage}")
@@ -740,7 +825,7 @@ targets.foreach { t =>
 }
 
 // ---------------------------------------------------------------------
-// 8. Verification
+// 9. Verification
 // ---------------------------------------------------------------------
 
 section(s"3/4  VERIFICATION  (mode=$MODE)")
@@ -775,7 +860,7 @@ if (DRY_RUN) {
 }
 
 // ---------------------------------------------------------------------
-// 9. Report
+// 10. Report
 // ---------------------------------------------------------------------
 
 section(s"4/4  REPORT  (mode=$MODE)")
@@ -786,6 +871,7 @@ println(s"tables in $DB         : ${allTables.length}")
 println(s"in scope              : ${targets.length}")
 println(s"out of scope          : ${outOf.length}")
 println(s"phases                : rename=$DO_RENAME recreate=$DO_RECREATE")
+println(s"purge flipped to false: $cPurgeFlipped")
 println(s"dirs renamed          : ${outcomes.map(_.renamed).sum}")
 println(s"dirs merged           : ${outcomes.map(_.merged).sum}")
 println(s"files moved           : ${outcomes.map(_.filesMoved).sum}")

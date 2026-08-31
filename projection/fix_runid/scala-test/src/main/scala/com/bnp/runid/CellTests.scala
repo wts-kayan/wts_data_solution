@@ -410,6 +410,31 @@ object CellTests {
     root
   }
 
+  /** A runid-partitioned EXTERNAL table carrying external.table.purge, the way
+    * CDP's TRANSLATED_TO_EXTERNAL tables do. With the flag true a DROP -- of
+    * the table OR of a partition -- would take the HDFS data with it. */
+  private def runidPurgeTable(db: String, t: String, values: Seq[String],
+                              purge: Boolean): JPath = {
+    val root = newRoot(s"fixall-$t-")
+    values.foreach(v => writeOrcPartition(root, "runid", v, 1))
+    spark.sql(s"DROP TABLE IF EXISTS $db.$t")
+    spark.sql(
+      s"""CREATE EXTERNAL TABLE $db.$t (
+         |  `matrixMigrationName` string,
+         |  `asOfDate` string,
+         |  `scenario` string,
+         |  `notationCode` string)
+         |PARTITIONED BY (`runid` string)
+         |STORED AS ORC
+         |LOCATION '${uri(root)}'
+         |TBLPROPERTIES ('external.table.purge'='${purge.toString}',
+         |               'TRANSLATED_TO_EXTERNAL'='TRUE')""".stripMargin)
+    values.foreach(v =>
+      spark.sql(s"ALTER TABLE $db.$t ADD IF NOT EXISTS PARTITION (runid='$v') " +
+                s"LOCATION '${uri(root)}/runid=$v'"))
+    root
+  }
+
   /** Directory names directly under a table root, sorted. */
   private def dirNames(root: JPath): Seq[String] = {
     val st = Files.list(root)
@@ -1200,6 +1225,77 @@ object CellTests {
       assertFalse("a nested table must not be recreated even with phase 1 off",
                   spark.table(s"$db.t_nested").schema.fieldNames.contains("runId"))
       assertTrue("and its data must still be where it was", Files.exists(inner))
+    }
+
+    // These tables are TRANSLATED_TO_EXTERNAL with purge=TRUE, so this is the
+    // normal path. Excluding them would mean the batch did nothing at all.
+    check("purge=true is fixed, not skipped, and the data survives") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_purge"
+      makeDb(db)
+      val root = runidPurgeTable(db, "t_purge", Seq("aaa1", "bbb2"), purge = true)
+      val out = Files.createTempDirectory("fixall-purge-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      }
+      assertTrue("a purge=true table must be IN scope", log.contains("IN SCOPE  " + db + ".t_purge"))
+      assertEquals("its directories must be re-cased",
+                   Seq("runId=aaa1", "runId=bbb2"), dirNames(root))
+      assertEquals("and every file must still be on disk", 2,
+                   tree(root).count(_.endsWith(".orc")))
+      assertTrue("Spark's schema must carry runId",
+                 spark.table(s"$db.t_purge").schema.fieldNames.contains("runId"))
+      assertEquals("with both partitions registered", 2L,
+                   spark.sql(s"SHOW PARTITIONS $db.t_purge").count())
+      assertEquals("and both rows readable", 2L, spark.table(s"$db.t_purge").count())
+    }
+
+    // The flag has to come down BEFORE the first DROP, not after it. Phase 1
+    // issues DROP PARTITION and phase 2 issues DROP TABLE; with purge=true
+    // either one deletes the directory.
+    check("purge is set false before the first drop is issued") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_purgeorder"
+      makeDb(db)
+      runidPurgeTable(db, "t_order", Seq("aaa1"), purge = true)
+      val out = Files.createTempDirectory("fixall-purgeorder-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      }
+      val verifiedAt = log.indexOf(db + ".t_order : external.table.purge verified")
+      val dropAt     = log.indexOf("DROP IF EXISTS PARTITION")
+      assertTrue("the flip must be verified, got no line", verifiedAt >= 0)
+      if (dropAt >= 0)
+        assertTrue("the verification must come BEFORE any DROP PARTITION",
+                   verifiedAt < dropAt)
+      assertEquals("and the flag must end up false, not true", "false",
+                   Option(purgeOf(db, "t_order")).filter(_.nonEmpty).getOrElse("false"))
+    }
+
+    // "no runid partition -> skip it, don't do any change" means NO change at
+    // all, table properties included: an out-of-scope table must not even have
+    // its purge flag touched.
+    check("an out-of-scope table keeps even its purge flag") {
+      val db = "fixall_untouched"
+      makeDb(db)
+      extPlainTable(db, "no_parts")                       // purge=true, no partitions
+      spark.sql(s"DROP TABLE IF EXISTS $db.other_key")
+      spark.sql(s"CREATE EXTERNAL TABLE $db.other_key (a string) " +
+                s"PARTITIONED BY (asofdate string) STORED AS ORC " +
+                s"LOCATION '${uri(newRoot("fixall-untouched-other-"))}' " +
+                s"TBLPROPERTIES ('external.table.purge'='true')")
+      runidPurgeTable(db, "t_purge", Seq("aaa1"), purge = true)
+      val out = Files.createTempDirectory("fixall-untouched-")
+      generated.FixAllCell.run(spark, Map(
+        "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      assertEquals("a non-partitioned table must keep purge=true untouched",
+                   "true", purgeOf(db, "no_parts"))
+      assertEquals("so must one partitioned by another column",
+                   "true", purgeOf(db, "other_key"))
+      assertTrue("both must still exist", tableNames(db).contains("no_parts") &&
+                                          tableNames(db).contains("other_key"))
     }
 
     check("a second run is a clean no-op") {
