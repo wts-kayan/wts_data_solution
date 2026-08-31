@@ -315,8 +315,51 @@ if (METASTORE_PREFLIGHT && !tableExists(HIVE_TABLE)) {
     sys.error(s"ABORT: $HIVE_TABLE is a MANAGED_TABLE. ALTER TABLE ... DROP PARTITION " +
               "would DELETE the underlying HDFS data. Nothing was modified.")
   }
+/** Read external.table.purge back from the metastore. The whole property map
+  * on purpose: SHOW TBLPROPERTIES with a key argument does not return a bare
+  * value, and misreading it here would be the worst possible place to be wrong.
+  * "" means absent, which is as good as false; "<unreadable>" never counts as
+  * off. */
+def purgeNow(): String =
+  Try(spark.sql(s"SHOW TBLPROPERTIES $HIVE_TABLE").collect()
+           .map(r => (r.get(0).toString.trim,
+                      Option(r.get(1)).map(_.toString.trim).getOrElse("")))
+           .toMap.getOrElse("external.table.purge", ""))
+    .getOrElse("<unreadable>")
+
+def purgeIsOff(v: String): Boolean = v.isEmpty || v.trim.toLowerCase == "false"
+
   if (tableType == "EXTERNAL") {
-    log("OK", "table type confirmed EXTERNAL -> DROP PARTITION is metastore-only")
+    // EXTERNAL alone is not enough. With external.table.purge=true Hive deletes
+    // the data on a drop, and that applies to DROP PARTITION as well as to DROP
+    // TABLE -- and the re-registration below issues DROP PARTITION. The renames
+    // happen to run first, so the drop usually lands on a path that no longer
+    // exists, but that is an accident of ordering and not something to rely on.
+    // So the flag comes down first, and is verified.
+    val purgeBefore = purgeNow()
+    if (purgeIsOff(purgeBefore)) {
+      log("OK", "table type confirmed EXTERNAL and external.table.purge is not set " +
+                "-> DROP PARTITION is metastore-only")
+    } else if (DRY_RUN) {
+      log("PLAN", s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES " +
+                  s"('external.table.purge'='false')   (currently '$purgeBefore') -- " +
+                  "must be verified false before any DROP PARTITION")
+    } else {
+      Try(spark.sql(s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES " +
+                    "('external.table.purge'='false')"))
+        .failed.foreach(e =>
+          log("ERROR", s"could not set external.table.purge=false: ${e.getMessage}"))
+      val after = purgeNow()
+      if (purgeIsOff(after)) {
+        log("OK", "external.table.purge verified false -> DROP PARTITION is metastore-only")
+      } else {
+        ddlExecutionAllowed = false
+        log("ERROR", s"external.table.purge still reads '$after'. DROP PARTITION would " +
+                     "DELETE the partition data, so NO DDL will be executed. The HDFS " +
+                     "renames below are safe and still run; replay the DDL by hand once " +
+                     "the flag is false.")
+      }
+    }
   } else {
     ddlExecutionAllowed = false
     log("ERROR", "could not confirm the table type is EXTERNAL. The HDFS renames will " +

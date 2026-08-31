@@ -733,6 +733,40 @@ object CellTests {
                  partitionLocations(DB, "ren")("aaa1").endsWith("runId=aaa1"))
     }
 
+    // The re-registration issues DROP PARTITION, which with purge=true deletes
+    // the partition directory. The renames run first so the drop usually lands
+    // on a path that no longer exists, but that is an accident of ordering.
+    check("purge is flipped before the re-registration drops a partition") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val root = newRoot("rename-purge")
+      writeOrcPartition(root, "runid", "aaa1", 1)
+      spark.sql(s"DROP TABLE IF EXISTS $DB.ren_purge")
+      spark.sql(
+        s"""CREATE EXTERNAL TABLE $DB.ren_purge (`a` string)
+           |PARTITIONED BY (`runid` string)
+           |STORED AS ORC
+           |LOCATION '${uri(root)}'
+           |TBLPROPERTIES ('external.table.purge'='true')""".stripMargin)
+      spark.sql(s"ALTER TABLE $DB.ren_purge ADD IF NOT EXISTS PARTITION (runid='aaa1') " +
+                s"LOCATION '${uri(root)}/runid=aaa1'")
+      val log = capturingStdout {
+        generated.RenameCell.run(spark, Map(
+          "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.ren_purge",
+          "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-ren-purge.sql")))
+      }
+      val verifiedAt = log.indexOf("external.table.purge verified false")
+      // likewise: the plan is printed first, so match the EXECUTED statement
+      val dropAt     = log.indexOf("EXEC   ALTER TABLE " + DB + ".ren_purge DROP IF EXISTS")
+      assertTrue("the flip must be verified, got no line", verifiedAt >= 0)
+      if (dropAt >= 0)
+        assertTrue("the verification must come BEFORE any DROP PARTITION",
+                   verifiedAt < dropAt)
+      assertTrue("the renamed dir must exist", Files.exists(root.resolve("runId=aaa1")))
+      assertEquals("and no file may be lost", 1, tree(root).count(_.endsWith(".orc")))
+      assertTrue("the metastore must be re-pointed",
+                 partitionLocations(DB, "ren_purge")("aaa1").endsWith("runId=aaa1"))
+    }
+
     check("refuses a dir that still holds a nested runid=") {
       val root = newRoot("rename-nested")
       val outer = root.resolve("runid=fff6")
@@ -841,6 +875,45 @@ object CellTests {
                  cols.contains("matrixMigrationName"))
       assertEquals("the partition must be re-registered", 1L,
                    spark.sql(s"SHOW PARTITIONS $DB.rec_real").count())
+    }
+
+    // purge=true used to abort the recreate. These tables are
+    // TRANSLATED_TO_EXTERNAL and carry it as a matter of course, so refusing
+    // meant refusing to do the job. It is flipped and verified instead, and
+    // never dropped while the flag still reads true.
+    check("purge=true is flipped to false before the DROP, not refused") {
+      val root = newRoot("recreate-purge")
+      writeOrcPartition(root, "runId", "aaa1", 1)
+      spark.sql(s"DROP TABLE IF EXISTS $DB.rec_purge")
+      spark.sql(
+        s"""CREATE EXTERNAL TABLE $DB.rec_purge (`a` string)
+           |PARTITIONED BY (`runid` string)
+           |STORED AS ORC
+           |LOCATION '${uri(root)}'
+           |TBLPROPERTIES ('external.table.purge'='true')""".stripMargin)
+      spark.sql(s"ALTER TABLE $DB.rec_purge ADD IF NOT EXISTS PARTITION (runid='aaa1') " +
+                s"LOCATION '${uri(root)}/runId=aaa1'")
+      val log = capturingStdout {
+        generated.RecreateCell.run(spark, Map(
+          "HIVE_TABLE" -> s"$DB.rec_purge", "TABLE_ROOT" -> uri(root),
+          "DRY_RUN" -> "false", "FIX_MODE" -> "recreate",
+          "DDL_OUTPUT_PATH" -> ddl(root, "rec-purge.sql"),
+          "BACKUP_OUTPUT_PATH" -> ddl(root, "rec-purge-backup.sql")))
+      }
+      val verifiedAt = log.indexOf("external.table.purge verified false")
+      // the DDL is PRINTED as a plan before it runs, so match the EXECUTED line
+      val dropAt     = log.indexOf("EXEC   DROP TABLE IF EXISTS " + DB + ".rec_purge")
+      assertTrue("the flip must be verified, got no line", verifiedAt >= 0)
+      assertTrue("the DROP must be executed, got no line", dropAt >= 0)
+      assertTrue("and the verification must come BEFORE the DROP", verifiedAt < dropAt)
+      assertTrue("the data must survive", Files.exists(root.resolve("runId=aaa1")))
+      assertTrue("the recreate must have done its job",
+                 spark.table(s"$DB.rec_purge").schema.fieldNames.contains("runId"))
+      assertEquals("with the partition back", 1L,
+                   spark.sql(s"SHOW PARTITIONS $DB.rec_purge").count())
+      assertTrue("and the emitted DDL must carry the ALTER, for a beeline replay",
+                 readArtifact(root.getParent, "rec-purge.sql")
+                   .contains("'external.table.purge'='false'"))
     }
 
     check("DRY_RUN leaves the metastore untouched") {

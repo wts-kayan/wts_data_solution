@@ -81,8 +81,10 @@
 //  ------------------------------------------------------
 //    * the table must be EXTERNAL -- DROP TABLE on a MANAGED table deletes
 //      the data directory;
-//    * 'external.table.purge' must NOT be 'true' -- with that property set,
-//      DROP TABLE deletes the data even for an EXTERNAL table;
+//    * 'external.table.purge' is set to false and VERIFIED before the DROP --
+//      with that property set, DROP TABLE deletes the data even for an
+//      EXTERNAL table. It is never dropped while the flag reads true, and if
+//      the property cannot be read at all the recreate is refused;
 //    * in "recreate" mode the partition inventory must be non-empty and
 //      fully captured, otherwise the script refuses to drop;
 //    * the schema must be capturable in Spark's own JSON form.
@@ -338,17 +340,39 @@ if (tableType != "EXTERNAL")
             "table definition. Nothing was modified.")
 log("OK", "table is EXTERNAL")
 
-if (purgeFlag != null && purgeFlag.trim.toLowerCase == "true")
-  sys.error(s"ABORT: $HIVE_TABLE has external.table.purge=true. DROP TABLE would DELETE " +
-            "the data even though the table is EXTERNAL. Unset it first:\n" +
-            s"  ALTER TABLE $HIVE_TABLE UNSET TBLPROPERTIES ('external.table.purge');\n" +
-            "Nothing was modified.")
+/** Read external.table.purge back from the metastore. The whole property map
+  * on purpose: SHOW TBLPROPERTIES with a key argument does not return a bare
+  * value, and misreading it here would be the worst possible place to be wrong.
+  * "" means absent, which is as good as false; "<unreadable>" never counts as
+  * off. */
+def purgeNow(): String =
+  Try(spark.sql(s"SHOW TBLPROPERTIES $HIVE_TABLE").collect()
+           .map(r => (r.get(0).toString.trim,
+                      Option(r.get(1)).map(_.toString.trim).getOrElse("")))
+           .toMap.getOrElse("external.table.purge", ""))
+    .getOrElse("<unreadable>")
+
+def purgeIsOff(v: String): Boolean = v.isEmpty || v.trim.toLowerCase == "false"
+
+// external.table.purge=true makes DROP TABLE delete the HDFS data even though
+// the table is EXTERNAL. That is not a reason to refuse -- these tables are
+// TRANSLATED_TO_EXTERNAL and carry it as a matter of course -- it is a step to
+// take first: set it to false, verify the metastore agrees, and only then
+// drop. The flip happens at execution time, never in a dry run.
+val needsPurgeFlip = purgeFlag != null && purgeFlag.trim.toLowerCase == "true"
+if (needsPurgeFlip)
+  log("PLAN", s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES " +
+              s"('external.table.purge'='false')   (currently '$purgeFlag') -- " +
+              "must be verified false before the DROP")
+
+// Unreadable is different from true: it cannot be ruled out, so it is refused.
 if (purgeFlag == null && FIX_MODE == "recreate")
   sys.error(s"ABORT: could not read the TBLPROPERTIES of $HIVE_TABLE, so " +
             "external.table.purge cannot be ruled out. If it were true, DROP TABLE would " +
             "DELETE the data. Refusing to recreate. Use FIX_MODE='alter', or fix the " +
             "metastore access first. Nothing was modified.")
-log("OK", "external.table.purge is not set -> DROP TABLE is metastore-only")
+if (!needsPurgeFlip)
+  log("OK", "external.table.purge is not set -> DROP TABLE is metastore-only")
 
 if (dataCols.isEmpty)
   sys.error(s"ABORT: no data columns could be read from DESCRIBE FORMATTED $HIVE_TABLE. " +
@@ -490,6 +514,10 @@ if (FIX_MODE == "alter") {
   statements += s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES (\n${propsBlock(schemaProps)}\n);"
 } else {
   val colsDdl = dataFields.map(f => s"  `${f.name}` ${f.dataType.sql}").mkString(",\n")
+  // First, so a replay of this file through beeline is as safe as the run.
+  if (needsPurgeFlip)
+    statements += s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES " +
+                  "('external.table.purge'='false');"
   statements += s"DROP TABLE IF EXISTS $HIVE_TABLE;"
   // A datasource table: LOCATION makes it EXTERNAL, and Spark persists
   // spark.sql.sources.schema / numPartCols / partCol.0 itself, taking the
@@ -550,6 +578,23 @@ if (DRY_RUN) {
   sys.error(s"ABORT: the backup file could not be written to $BACKUP_OUTPUT_PATH. " +
             "Refusing to DROP the table without a replayable backup. Nothing was modified.")
 } else {
+  // The purge flag comes down BEFORE the DROP, and the metastore has to agree
+  // that it is down. Nothing has been modified at this point, so refusing here
+  // is free.
+  if (needsPurgeFlip) {
+    Try(spark.sql(s"ALTER TABLE $HIVE_TABLE SET TBLPROPERTIES " +
+                  "('external.table.purge'='false')"))
+      .failed.foreach(e =>
+        sys.error(s"ABORT: could not set external.table.purge=false on $HIVE_TABLE " +
+                  s"(${e.getMessage}). DROP TABLE would DELETE the data. " +
+                  "Nothing was modified."))
+    val after = purgeNow()
+    if (!purgeIsOff(after))
+      sys.error(s"ABORT: external.table.purge on $HIVE_TABLE still reads '$after' after " +
+                "the ALTER. DROP TABLE would DELETE the data. Nothing else was modified.")
+    log("OK", s"external.table.purge verified false -> DROP TABLE is metastore-only")
+  }
+
   var failures = 0
   statements.foreach { stmt =>
     val sql = stmt.trim.stripSuffix(";")
