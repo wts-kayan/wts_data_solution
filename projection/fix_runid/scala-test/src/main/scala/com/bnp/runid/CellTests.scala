@@ -578,7 +578,7 @@ object CellTests {
     // _SUCCESS and friends are never moved: they describe the write that made
     // the directory, and moving them would relabel a different directory. The
     // cell keeps them, and therefore must NOT delete the dir they sit in.
-    check("markers stay put and their dir survives the merge") {
+    check("a merged nested dir goes, marker and all") {
       val root = newRoot("flatten-markers")
       val inner = root.resolve("runId=hhh8").resolve("runid=hhh8")
       writeNamedOrc(inner, "part-0.orc", "data")
@@ -589,9 +589,11 @@ object CellTests {
         "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-mark.sql")))
       assertTrue("the data file must be promoted",
                  Files.exists(root.resolve("runId=hhh8").resolve("part-0.orc")))
-      assertTrue("the marker must be left where it was",
-                 Files.exists(inner.resolve("_SUCCESS")))
-      assertFalse("the marker must not have been promoted too",
+      // The merge keeps markers in place, but the sub-directory pass then
+      // removes the directory they are sitting in -- a partition dir holds
+      // files, not folders.
+      assertFalse("the nested dir must not survive", Files.exists(inner))
+      assertFalse("and the marker must not have been promoted into the partition dir",
                   Files.exists(root.resolve("runId=hhh8").resolve("_SUCCESS")))
     }
 
@@ -599,7 +601,7 @@ object CellTests {
     // is no data to promote -- so it used to survive every re-run and be left
     // for a human. It is still a runid= dir under a runId= one, which is the
     // layout this script exists to remove.
-    check("a marker-only nested dir is left, and named, by default") {
+    check("a marker-only nested dir is removed by default") {
       val root = newRoot("flatten-markeronly")
       val inner = root.resolve("runId=mmm1").resolve("runid=mmm1")
       writeNamedOrc(root.resolve("runId=mmm1"), "part-0.orc", "data")
@@ -608,8 +610,11 @@ object CellTests {
       generated.FlattenCell.run(spark, Map(
         "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_mo",
         "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-mo.sql")))
-      assertTrue("the default must not delete anything holding a marker",
-                 Files.exists(inner))
+      // It used to need DELETE_MARKERS_ON_MERGE=true. The sub-directory pass
+      // removes it whatever that flag says, because it holds no data.
+      assertFalse("the marker-only nested dir must be gone", Files.exists(inner))
+      assertTrue("the partition's own data must be untouched",
+                 Files.exists(root.resolve("runId=mmm1").resolve("part-0.orc")))
     }
 
     check("DELETE_MARKERS_ON_MERGE=true removes a marker-only nested dir") {
@@ -650,7 +655,7 @@ object CellTests {
     // The state a real run lands in, and the way out of it. This is the
     // sequence to actually run against the cluster when a runid= dir is found
     // still sitting under a runId= one.
-    check("a leftover nested dir is cleared by a re-run with the flag on") {
+    check("one pass clears the nested dir, no second run needed") {
       val root = newRoot("flatten-recovery")
       val inner = root.resolve("runId=ppp4").resolve("runid=ppp4")
       writeNamedOrc(inner, "part-0.orc", "data")
@@ -659,44 +664,162 @@ object CellTests {
       addPartition(DB, "flat_rec", "ppp4", uri(root) + "/runId=ppp4/runid=ppp4")
       val cfg = Map("TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_rec",
                     "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-rec.sql"))
-
-      // pass 1, default flag: data is promoted, the marker dir survives
       generated.FlattenCell.run(spark, cfg)
-      assertTrue("pass 1 must promote the data",
+      assertTrue("the data must be promoted",
                  Files.exists(root.resolve("runId=ppp4").resolve("part-0.orc")))
-      assertTrue("pass 1 leaves the marker dir behind", Files.exists(inner))
-      assertTrue("but the metastore must already be re-pointed",
+      assertFalse("and the nested dir gone in the SAME pass", Files.exists(inner))
+      assertTrue("with the metastore re-pointed",
                  partitionLocations(DB, "flat_rec")("ppp4").endsWith("runId=ppp4"))
-
-      // pass 2, flag on: the leftover goes, the data does not
-      generated.FlattenCell.run(spark, cfg + ("DELETE_MARKERS_ON_MERGE" -> "true"))
-      assertFalse("pass 2 must clear the leftover", Files.exists(inner))
-      assertTrue("and must not touch the promoted data",
-                 Files.exists(root.resolve("runId=ppp4").resolve("part-0.orc")))
-      assertEquals("the partition must still read back", 1L,
+      assertEquals("and the partition still readable", 1L,
                    spark.table(s"$DB.flat_rec").count())
     }
 
     // A leftover that is never mentioned is the real danger: the run reads as
     // a success while the nested layout it exists to remove is still there.
-    check("a surviving nested dir is named in the report, not hidden") {
+    check("a nested dir that IS refused is named in the report") {
       val root = newRoot("flatten-report")
-      val inner = root.resolve("runId=qqq5").resolve("runid=qqq5")
-      writeNamedOrc(inner, "part-0.orc", "data")
-      writeMarker(inner, "_SUCCESS")
+      // a different run id: the one nesting the script refuses to promote, so
+      // it really does survive and the run must say so rather than read clean
+      writeNamedOrc(root.resolve("runId=qqq5"), "part-0.orc", "mine")
+      writeNamedOrc(root.resolve("runId=qqq5").resolve("runid=rrr6"), "part-0.orc", "other")
       createTable(DB, "flat_report", root)
       val out = capturingStdout {
         generated.FlattenCell.run(spark, Map(
           "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_report",
           "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-report.sql")))
       }
-      assertTrue("the leftover must survive for this test to mean anything",
-                 Files.exists(inner))
+      assertTrue("the refused dir must survive for this test to mean anything",
+                 Files.exists(root.resolve("runId=qqq5").resolve("runid=rrr6")))
       assertTrue("the run must name the surviving nested dir",
-                 out.contains("runid=qqq5") &&
+                 out.contains("runid=rrr6") &&
                  out.contains("nested 'runId=' dir(s) still under a partition dir"))
       assertFalse("and must not claim the tree is clean",
                   out.contains("no nested 'runId=' directory left"))
+    }
+
+    // A partition directory holds files. Anything shaped like a directory
+    // inside one is left over from the writer defect, and the flatten only
+    // recognises the <key>=<X>/<key>=<X> shape -- a stray name would survive
+    // it and keep spark.read.orc seeing mixed depths.
+    check("a stray folder inside a partition dir is emptied and deleted") {
+      val root = newRoot("flatten-stray")
+      writeNamedOrc(root.resolve("runId=sss1"), "part-0.orc", "kept")
+      writeNamedOrc(root.resolve("runId=sss1").resolve("foo"), "part-9.orc", "promoted")
+      createTable(DB, "flat_stray", root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_stray",
+        "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-stray.sql")))
+      assertFalse("the stray folder must be gone",
+                  Files.exists(root.resolve("runId=sss1").resolve("foo")))
+      val body = orcTags(root.resolve("runId=sss1"))
+      assertEquals("both files must sit in the partition dir, got " + body.keys.toSeq.sorted,
+                   2, body.size)
+      assertTrue("the file already there must be untouched",
+                 body.get("part-0.orc").contains("kept"))
+      assertTrue("and the one inside the folder must be promoted, not deleted",
+                 body.values.toSeq.contains("promoted"))
+    }
+
+    check("a folder nested several levels deep is flattened out") {
+      val root = newRoot("flatten-deep")
+      val deep = root.resolve("runId=ttt2").resolve("a").resolve("b")
+      writeNamedOrc(deep, "part-0.orc", "deep")
+      createTable(DB, "flat_deep", root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_deep",
+        "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-deep.sql")))
+      assertFalse("the whole tree must be gone",
+                  Files.exists(root.resolve("runId=ttt2").resolve("a")))
+      assertTrue("with the data promoted to the partition dir",
+                 orcTags(root.resolve("runId=ttt2")).values.toSeq.contains("deep"))
+    }
+
+    check("an empty folder inside a partition dir is deleted") {
+      val root = newRoot("flatten-emptydir")
+      writeNamedOrc(root.resolve("runId=uuu3"), "part-0.orc", "data")
+      Files.createDirectories(root.resolve("runId=uuu3").resolve("leftover"))
+      createTable(DB, "flat_emptydir", root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_emptydir",
+        "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-emptydir.sql")))
+      assertFalse("the empty folder must be gone",
+                  Files.exists(root.resolve("runId=uuu3").resolve("leftover")))
+      assertTrue("and the data must be untouched",
+                 Files.exists(root.resolve("runId=uuu3").resolve("part-0.orc")))
+    }
+
+    // The one folder that must NOT be swallowed: a different run id. Promoting
+    // it would merge two distinct runs.
+    check("a folder for a different run id is refused, not merged") {
+      val root = newRoot("flatten-otherrun")
+      writeNamedOrc(root.resolve("runId=vvv4"), "part-0.orc", "mine")
+      writeNamedOrc(root.resolve("runId=vvv4").resolve("runid=www5"), "part-0.orc", "other")
+      createTable(DB, "flat_otherrun", root)
+      val log = capturingStdout {
+        generated.FlattenCell.run(spark, Map(
+          "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_otherrun",
+          "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-otherrun.sql")))
+      }
+      assertTrue("the other run's dir must be left alone",
+                 Files.exists(root.resolve("runId=vvv4").resolve("runid=www5")
+                                  .resolve("part-0.orc")))
+      assertTrue("and the refusal must be reported", log.contains("UUID MISMATCH"))
+      assertEquals("nothing may have been promoted into the partition dir", 1,
+                   orcTags(root.resolve("runId=vvv4")).size)
+    }
+
+    check("a protected folder inside a partition dir is never deleted") {
+      val root = newRoot("flatten-staging")
+      writeNamedOrc(root.resolve("runId=xxx6"), "part-0.orc", "data")
+      val staging = root.resolve("runId=xxx6").resolve(".hive-staging_abc")
+      writeMarker(staging, "in-flight")
+      createTable(DB, "flat_staging", root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_staging",
+        "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-staging.sql")))
+      assertTrue("a staging dir may belong to a running write, so it stays",
+                 Files.exists(staging))
+    }
+
+    check("DRY_RUN deletes no folder inside a partition dir") {
+      val root = newRoot("flatten-subdir-dry")
+      writeNamedOrc(root.resolve("runId=yyy7"), "part-0.orc", "kept")
+      writeNamedOrc(root.resolve("runId=yyy7").resolve("foo"), "part-9.orc", "promoted")
+      createTable(DB, "flat_subdir_dry", root)
+      val before = tree(root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_subdir_dry",
+        "DRY_RUN" -> "true", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-subdir-dry.sql")))
+      assertEquals("the tree must be untouched", before, tree(root))
+    }
+
+    // The leftover that DELETE_MARKERS_ON_MERGE used to be needed for is now
+    // removed by the sub-directory pass, with the marker inside it.
+    check("a marker-only nested dir is now removed by the subdir pass") {
+      val root = newRoot("flatten-markergone")
+      val inner = root.resolve("runId=zzz8").resolve("runid=zzz8")
+      writeNamedOrc(root.resolve("runId=zzz8"), "part-0.orc", "data")
+      writeMarker(inner, "_SUCCESS")
+      createTable(DB, "flat_markergone", root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_markergone",
+        "DRY_RUN" -> "false", "DDL_OUTPUT_PATH" -> ddl(root, "ddl-markergone.sql")))
+      assertFalse("the nested dir must be gone", Files.exists(inner))
+      assertTrue("and the partition's own data untouched",
+                 Files.exists(root.resolve("runId=zzz8").resolve("part-0.orc")))
+    }
+
+    check("DELETE_SUBDIRS_IN_PARTITIONS=false leaves folders alone") {
+      val root = newRoot("flatten-subdir-off")
+      writeNamedOrc(root.resolve("runId=aab9"), "part-0.orc", "kept")
+      writeNamedOrc(root.resolve("runId=aab9").resolve("foo"), "part-9.orc", "left")
+      createTable(DB, "flat_subdir_off", root)
+      val before = tree(root)
+      generated.FlattenCell.run(spark, Map(
+        "TABLE_ROOT" -> uri(root), "HIVE_TABLE" -> s"$DB.flat_subdir_off",
+        "DRY_RUN" -> "false", "DELETE_SUBDIRS_IN_PARTITIONS" -> "false",
+        "DDL_OUTPUT_PATH" -> ddl(root, "ddl-subdir-off.sql")))
+      assertEquals("nothing may move when the pass is off", before, tree(root))
     }
 
     check("DELETE_MARKERS_ON_MERGE=true clears the nested dir") {

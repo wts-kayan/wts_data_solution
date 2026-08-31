@@ -58,11 +58,23 @@
 //    Spark-on-Hive behaviour. The script touches partitions ONLY, never the
 //    table schema or TBLPROPERTIES.
 //
+//  NO DIRECTORY INSIDE A PARTITION DIRECTORY
+//  -----------------------------------------
+//  A partition directory holds files. After the flatten, any directory still
+//  sitting inside one is emptied -- every data file promoted up, at any depth
+//  -- and then deleted. That covers what the flatten does not recognise: a
+//  stray `foo/`, a deeper `a/b/`, or a nested dir that survived because it
+//  still held a marker. Two exceptions, both reported: a protected directory
+//  (.hive-staging, _temporary: a write may still be running) and a
+//  `<key>=<other uuid>` directory, which would merge two distinct runs.
+//  Set DELETE_SUBDIRS_IN_PARTITIONS = false to turn the pass off.
+//
 //  SAFETY
 //  ------
 //  UAT data with no backup: every action is logged with its full path,
 //  every ambiguous case is SKIPPED and reported instead of guessed, and a
-//  wrapper is deleted only after it has been verified empty.
+//  wrapper is deleted only after it has been verified empty. No directory is
+//  ever deleted while it still holds a data file.
 // =====================================================================
 
 import java.net.URI
@@ -109,6 +121,16 @@ val DDL_OUTPUT_PATH =
 // wrapper alive. Set to true to let the script delete those markers so the
 // wrapper can be removed. Data files are NEVER deleted, whatever the value.
 val DELETE_MARKERS_ON_MERGE = false
+
+// A partition directory holds FILES. Any directory inside one is left over
+// from the writer defect, so it is emptied of data -- every file promoted into
+// the partition directory -- and then deleted. This catches the shapes the
+// flatten above does not recognise: a stray 'foo/', a deeper 'a/b/', or a
+// nested dir that survived because it still held a marker.
+// Two things are never deleted this way: a protected directory (.hive-staging,
+// _temporary -- a write may still be running), and a '<key>=<other uuid>'
+// directory, which would merge two distinct runs.
+val DELETE_SUBDIRS_IN_PARTITIONS = true
 
 // Metastore pre-flight: one DESCRIBE FORMATTED per registered partition
 // -> can be slow on a table with thousands of partitions. Turning it off
@@ -206,7 +228,7 @@ case class Plan(var kind: String, wrapper: Path, inner: Path, target: Path,
 // 4. Discovery (read-only)
 // ---------------------------------------------------------------------
 
-section(s"1/7  DISCOVERY  (mode=$MODE)  root=$TABLE_ROOT")
+section(s"1/8  DISCOVERY  (mode=$MODE)  root=$TABLE_ROOT")
 
 val plans           = ArrayBuffer[Plan]()
 val skipped         = ArrayBuffer[(String, String)]()   // reported, never touched
@@ -394,7 +416,7 @@ def catalogDiagnostics(name: String): Seq[String] = {
   out.toSeq
 }
 
-section(s"2/7  METASTORE PRE-FLIGHT  (table=$HIVE_TABLE)")
+section(s"2/8  METASTORE PRE-FLIGHT  (table=$HIVE_TABLE)")
 
 var tableType: String = null      // "EXTERNAL" | "MANAGED" | null (undetermined)
 val partOk       = ArrayBuffer[(String, String)]()
@@ -522,7 +544,7 @@ if (METASTORE_PREFLIGHT && !tableExists(HIVE_TABLE)) {
 // 6. Plan
 // ---------------------------------------------------------------------
 
-section("3/7  PLANNED ACTIONS")
+section("3/8  PLANNED ACTIONS")
 
 if (plans.isEmpty)
   log("INFO", "nothing to flatten - the layout is already canonical (idempotent no-op)")
@@ -554,7 +576,7 @@ plans.foreach { p =>
 // 7. Execution
 // ---------------------------------------------------------------------
 
-section(s"4/7  EXECUTION  (mode=$MODE)")
+section(s"4/8  EXECUTION  (mode=$MODE)")
 
 val flattened = ArrayBuffer[String]()   // run ids successfully flattened -> feed the DDL
 var cRename = 0; var cMerge = 0; var cDropEmpty = 0; var cMarkerDirsDeleted = 0
@@ -691,12 +713,138 @@ if (DRY_RUN) {
 }
 
 // ---------------------------------------------------------------------
-// 8. Hive re-registration DDL
+// 8. Sub-directory purge
+//
+//    A partition directory holds FILES. Any directory inside one is left over
+//    from the writer defect and has to go, whatever it is called -- the
+//    flatten above only recognises the `<key>=<X>/<key>=<X>` shape, and a
+//    stray `foo/` or a deeper `a/b/` would survive it and keep
+//    spark.read.orc() seeing mixed depths.
+//
+//    Data is never thrown away to achieve that. Every data file found at any
+//    depth inside the sub-directory is promoted into the partition directory
+//    first, with the same collision-safe rename the merge path uses, and only
+//    the emptied tree is deleted.
+//
+//    One case is still refused: a `<key>=<Y>` directory whose value differs
+//    from the partition it sits in. Promoting that would merge two distinct
+//    runs, which this script never guesses at -- the same rule as the UUID
+//    MISMATCH guard in discovery.
+// ---------------------------------------------------------------------
+
+section(s"5/8  SUB-DIRECTORY PURGE  (mode=$MODE)")
+
+var cSubdirsDeleted   = 0
+var cSubdirFilesMoved = 0
+val subdirPlans       = ArrayBuffer[(String, Int, Long)]()   // (path, files, bytes)
+val subdirRefused     = ArrayBuffer[(String, String)]()
+
+if (!DELETE_SUBDIRS_IN_PARTITIONS) {
+  log("INFO", "DELETE_SUBDIRS_IN_PARTITIONS=false -> sub-directories inside partition " +
+              "directories are left as they are")
+} else {
+
+  /** Every non-protected FILE under `dir`, at any depth. */
+  def filesUnder(dir: Path): Seq[FileStatus] = {
+    val out = ArrayBuffer[FileStatus]()
+    def walk(d: Path): Unit = ls(d).foreach { st =>
+      if (st.isDirectory) { if (!isProtected(st.getPath.getName)) walk(st.getPath) }
+      else if (!isProtected(st.getPath.getName)) out += st
+    }
+    Try(walk(dir))
+    out.toSeq
+  }
+
+  // Fresh listing: the execution above has already moved things around.
+  val partitionDirs = ls(root).filter { st =>
+    st.isDirectory && !isProtected(st.getPath.getName) &&
+    splitKey(st.getPath.getName)._1.toLowerCase == PARTITION_KEY_LC
+  }
+
+  partitionDirs.foreach { pd =>
+    val pdPath  = pd.getPath
+    val pdValue = splitKey(pdPath.getName)._2.getOrElse("")
+
+    ls(pdPath).filter(c => c.isDirectory).foreach { sub =>
+      val subPath = sub.getPath
+      val subName = subPath.getName
+      val (subKey, subValOpt) = splitKey(subName)
+
+      if (isProtected(subName)) {
+        // .hive-staging / _temporary can belong to a write that is still
+        // running. Reported, never deleted.
+        protectedSeen += ((subPath.toString,
+          "protected directory inside a partition dir - left untouched"))
+      } else if (subKey.toLowerCase == PARTITION_KEY_LC &&
+                 subValOpt.isDefined &&
+                 subValOpt.get.toLowerCase != pdValue.toLowerCase) {
+        subdirRefused += ((subPath.toString,
+          s"UUID MISMATCH: '$subName' sits inside '$PARTITION_KEY=$pdValue' - promoting it " +
+          "would merge two distinct runs, never guessed"))
+      } else {
+        val data  = filesUnder(subPath)
+        val bytes = data.map(_.getLen).sum
+        subdirPlans += ((subPath.toString, data.length, bytes))
+        log("PLAN", s"PROMOTE ${data.length} file(s) (${human(bytes)}) out of $subPath, " +
+                    s"then DELETE it")
+
+        if (!DRY_RUN) {
+          var ok = true
+          data.foreach { st =>
+            val src  = st.getPath
+            var dst  = new Path(pdPath, src.getName)
+            if (fs.exists(dst)) {
+              val short = UUID.randomUUID().toString.replaceAll("-", "").substring(0, 8)
+              dst = new Path(pdPath, "merged_" + short + "_" + src.getName)
+              log("WARN", s"collision on ${src.getName} -> renamed to ${dst.getName}")
+            }
+            if (fs.rename(src, dst)) {
+              cSubdirFilesMoved += 1
+              log("OK", s"MOVE   $src -> $dst")
+            } else {
+              ok = false
+              cFailed += 1
+              log("ERROR", s"MOVE FAILED $src -> $dst")
+            }
+          }
+          if (!ok) {
+            subdirRefused += ((subPath.toString,
+              "at least one file could not be promoted - directory KEPT, no data lost"))
+          } else {
+            // Everything that was data is out; what is left is empty dirs and
+            // markers, which is what this pass exists to remove.
+            val leftovers = Try(filesUnder(subPath)).getOrElse(Seq.empty)
+            if (leftovers.nonEmpty) {
+              subdirRefused += ((subPath.toString,
+                s"${leftovers.length} data file(s) appeared since the promotion - KEPT"))
+            } else if (fs.delete(subPath, true)) {
+              cSubdirsDeleted += 1
+              log("OK", s"DELETE $subPath   (emptied sub-directory)")
+            } else {
+              cFailed += 1
+              log("ERROR", s"DELETE FAILED $subPath")
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (subdirPlans.isEmpty && subdirRefused.isEmpty)
+    log("OK", s"no directory sits inside any '$PARTITION_KEY=' partition directory")
+  else
+    log("INFO", s"sub-directories: ${subdirPlans.length} to remove, " +
+                s"${subdirRefused.length} refused")
+  subdirRefused.foreach { case (sp, why) => log("WARN", s"  KEPT $sp : $why") }
+}
+
+// ---------------------------------------------------------------------
+// 9. Hive re-registration DDL
 //    partitionProvider=catalog -> explicit DDL is mandatory, MSCK REPAIR is
 //    not an option.
 // ---------------------------------------------------------------------
 
-section(s"5/7  HIVE DDL  (table=$HIVE_TABLE)")
+section(s"6/8  HIVE DDL  (table=$HIVE_TABLE)")
 
 val ddlStatements = ArrayBuffer[String]()
 
@@ -782,7 +930,7 @@ if (EMIT_HIVE_DDL) {
 // 9. Validation
 // ---------------------------------------------------------------------
 
-section("6/7  VALIDATION")
+section("7/8  VALIDATION")
 
 val remainingWrappers = ls(root).filter { st =>
   st.isDirectory && !isProtected(st.getPath.getName) && {
@@ -866,7 +1014,7 @@ if (DRY_RUN) {
 // 10. Report
 // ---------------------------------------------------------------------
 
-section(s"7/7  REPORT  (mode=$MODE)")
+section(s"8/8  REPORT  (mode=$MODE)")
 
 def planCount(kind: String): Int = plans.count(_.kind == kind)
 
@@ -879,6 +1027,10 @@ println(s"  by MERGE            : ${if (DRY_RUN) planCount("merge") else cMerge}
 println(s"  empty nested dropped: ${if (DRY_RUN) planCount("drop_empty") else cDropEmpty}")
 println(s"  marker-only dropped : ${if (DRY_RUN) planCount("drop_markers") else cMarkerDirsDeleted}")
 println(s"files moved           : $cFilesMoved")
+println(s"subdirs in partitions : ${if (DRY_RUN) subdirPlans.length else cSubdirsDeleted}" +
+        s"${if (DRY_RUN) "  (planned, DRY_RUN)" else " deleted"}" +
+        s"${if (subdirRefused.nonEmpty) s", ${subdirRefused.length} refused" else ""}")
+println(s"  files promoted      : ${if (DRY_RUN) subdirPlans.map(_._2).sum else cSubdirFilesMoved}")
 println(s"wrappers deleted      : $cWrappersDeleted")
 println(s"failures              : $cFailed")
 println(s"skipped               : ${skipped.length}")
@@ -895,6 +1047,13 @@ if (skipped.nonEmpty) {
   println("SKIPPED -- nothing was modified for these, they need a human decision")
   println("-" * 100)
   skipped.foreach { case (sp, reason) => println(s"  $sp\n      reason: $reason") }
+}
+
+if (subdirRefused.nonEmpty) {
+  println("")
+  println("SUB-DIRECTORIES KEPT -- inside a partition dir, but not safe to remove")
+  println("-" * 100)
+  subdirRefused.foreach { case (sp, why) => println(s"  $sp\n      $why") }
 }
 
 if (unregistered.nonEmpty) {
