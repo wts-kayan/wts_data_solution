@@ -1416,8 +1416,10 @@ object CellTests {
         cfg(db, out, dry = false) + ("DO_FLATTEN" -> "false"))
       }
       assertTrue("the nested dir must be left alone", Files.exists(inner))
-      assertTrue("the run must say to flatten it first",
-                 log.contains("flatten_nested_runid_partitions.scala"))
+      // Phase F is off here, and the report has to say THAT rather than send
+      // the operator to a script -- the batch does the flatten itself now.
+      assertTrue("the run must name DO_FLATTEN as the reason",
+                 log.contains("DO_FLATTEN=false"))
       assertTrue("and must list the table as still nested",
                  log.contains("STILL NESTED"))
       assertFalse("phase 2 must not have recreated it",

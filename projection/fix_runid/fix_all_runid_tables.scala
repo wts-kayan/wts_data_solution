@@ -21,17 +21,18 @@
 //
 //  WHAT THIS IS
 //  ------------
-//  The batch form of the two single-table cells that have already been run
-//  successfully against dbprojection.term_structure:
+//  The batch form of the three single-table cells, two of which have already
+//  been run successfully against dbprojection.term_structure:
 //
 //    flatten_nested_runid_partitions.scala  no directory inside a partition dir
 //    rename_partitions_to_runId.scala      on-disk  runid=<X> -> runId=<X>
 //    recreate_table_partcol_runid.scala    Spark's  partCol.0 -> runId
 //
 //  It finds every table in the database partitioned by `runid` and applies
-//  the same two phases to each, in the same order, with the same guards.
+//  the same three phases to each, in the same order, with the same guards.
 //  The single-table cells remain the right tool for one table; this one is
-//  for doing all of them without editing a config 60 times.
+//  for doing all of them without editing a config 60 times. Nothing has to be
+//  run before it: the flatten is phase F below, not a separate step.
 //
 //  THE THREE PHASES, PER TABLE
 //  ---------------------------
@@ -54,8 +55,9 @@
 //                      itself -- it refuses any property key starting with
 //                      'spark.sql.', so this is the only route from Spark.
 //
-//  Phase 1 runs first on purpose: phase 2 re-registers partitions at the
-//  locations the metastore holds, so those must already point at `runId=`.
+//  The order is not arbitrary. Phase F first, so the rename sees flat
+//  partition directories; phase 1 next, so phase 2 re-registers partitions at
+//  locations that already point at `runId=` and hold data.
 //
 //  WHY THE HIVE COLUMN STAYS LOWERCASE
 //  -----------------------------------
@@ -637,8 +639,10 @@ def renameOneTable(t: Target): RenameResult = {
           // Renaming a wrapper would only move the broken nesting under a new
           // name. This is the flatten script's job, and it is not guessed at.
           nested += full
-          skipped += ((full, s"still holds a nested '${nestedDirs(0).getPath.getName}' dir - " +
-            "run flatten_nested_runid_partitions.scala on this table FIRST"))
+          skipped += ((full, s"still holds a nested '${nestedDirs(0).getPath.getName}' dir " +
+            "after phase F - either phase F refused it (a different run id, or a " +
+            "protected dir) or DO_FLATTEN is off. Renaming the wrapper would only move " +
+            "the nesting under a new name"))
         } else if (childDirs.nonEmpty) {
           skipped += ((full, s"contains sub-directories " +
             s"(${childDirs.map(_.getPath.getName).mkString(", ")}) - unexpected layout"))
@@ -994,10 +998,18 @@ targets.foreach { t =>
   val nestedNow = nestedDirsOf(t)
 
   if (!hardFail && nestedNow.nonEmpty) {
-    log("WARN", s"$fq : ${nestedNow.length} nested dir(s) - phase 2 skipped, " +
-                "run flatten_nested_runid_partitions.scala on this table first")
+    // Phase F has already run by now (unless it is switched off), so a nesting
+    // that is still here is one it deliberately refused. Say which, rather
+    // than sending the operator off to a script that would refuse it too.
+    val why = if (DO_FLATTEN) "phase F refused them - see the KEPT lines above " +
+                              "(a different run id, or a protected directory)"
+              else "DO_FLATTEN=false, so nothing flattened them"
+    log("WARN", s"$fq : ${nestedNow.length} nested dir(s) still present - phase 2 " +
+                s"skipped. $why")
     nestedNow.foreach(n => log("WARN", s"  nested: $n"))
-    rc = RecreateResult(false, "nested runid= dirs present - flatten it first", 0)
+    rc = RecreateResult(false,
+      if (DO_FLATTEN) "nested dirs phase F refused - resolve them by hand"
+      else "nested dirs present and DO_FLATTEN=false", 0)
   } else if (!hardFail && ren.failed > 0) {
     // Half-fixed on disk. Recreating now would bake that half-state into a new
     // definition, so it waits for a clean phase 1.
@@ -1091,7 +1103,7 @@ println(f"${"table"}%-46s ${"renamed"}%7s ${"merged"}%6s ${"repoint"}%7s " +
         f"${"recreated"}%9s  note")
 println("-" * 110)
 outcomes.foreach { o =>
-  val note = if (o.nested > 0) s"NESTED x${o.nested} - flatten first"
+  val note = if (o.nested > 0) s"NESTED x${o.nested} - not recreated"
              else if (o.failed > 0) "FAILURES - see the log above"
              else o.recreateWhy
   println(f"  ${o.table}%-44s ${o.renamed}%7d ${o.merged}%6d ${o.repointed}%7d " +
@@ -1101,7 +1113,15 @@ outcomes.foreach { o =>
 val nested = outcomes.filter(_.nested > 0).map(_.table)
 if (nested.nonEmpty) {
   println("")
-  println("STILL NESTED -- run flatten_nested_runid_partitions.scala on these, then re-run")
+  if (DO_FLATTEN) {
+    println("STILL NESTED -- phase F refused these, so they were NOT recreated.")
+    println("Each is either a '<key>=<other uuid>' directory, which would merge two")
+    println("distinct runs, or a protected one that may belong to a running write.")
+    println("Resolve them by hand and re-run; there is no script that will guess.")
+  } else {
+    println("STILL NESTED -- DO_FLATTEN=false, so nothing flattened these and they")
+    println("were NOT recreated. Turn DO_FLATTEN on and re-run.")
+  }
   println("-" * 100)
   nested.foreach(t => println(s"  $DB.$t"))
 }
