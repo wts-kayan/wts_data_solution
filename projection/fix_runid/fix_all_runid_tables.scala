@@ -60,10 +60,23 @@
 //
 //  SCOPE
 //  -----
-//  A table is in scope when it has EXACTLY ONE partition column and that
-//  column is `runid`. Everything else is skipped and reported, and NOTHING is
-//  changed on it -- not even its table properties: no partition column, a
-//  different partition column, more than one, or MANAGED.
+//  A table is in scope when ALL of these hold:
+//    * it has EXACTLY ONE partition column, and that column is `runid`;
+//    * it is not MANAGED;
+//    * and its HDFS layout actually needs work -- at least one partition
+//      directory whose key is `runid` in the wrong case, or a nested
+//      `<key>=<X>/<key>=<Y>`.
+//
+//  That last one is the important gate: a table whose directories are ALL
+//  already `runId=` gets NOTHING done to it. Not a rename, not a recreate, not
+//  even a table-property change. The disk decides, not the catalog, because
+//  the disk is what the fix is about.
+//
+//  Everything else is skipped and reported, unchanged. One case is worth
+//  reading in the report: a table already `runId=` on disk whose Spark
+//  partCol.0 is still `runid` is left alone here, but a future Spark write
+//  would create `runid=` directories again. The report names those and points
+//  at recreate_table_partcol_runid.scala.
 //
 //  EXTERNAL.TABLE.PURGE
 //  --------------------
@@ -258,6 +271,39 @@ val onlyFilter = ONLY_TABLES.split(",").map(_.trim).filter(_.nonEmpty).toSet
 
 case class Target(name: String, location: String, purge: String, tableType: String)
 
+/** What the table's directories actually look like, read from HDFS.
+  *
+  *   wrongCase  top-level partition dirs whose key is runid in some casing
+  *              other than the wanted one  ->  these are what phase 1 renames
+  *   nested     `<key>=<X>/<key>=<Y>` nestings anywhere under the root
+  *   correct    top-level dirs already named exactly `runId=`
+  *
+  * The disk is the trigger for doing anything at all: a table whose data is
+  * already laid out correctly is left alone, whatever the catalog says. */
+case class DiskState(wrongCase: Seq[String], nested: Seq[String], correct: Int) {
+  def needsWork: Boolean = wrongCase.nonEmpty || nested.nonEmpty
+}
+
+def diskStateOf(location: String): Option[DiskState] = Try {
+  val fs   = FileSystem.get(new URI(location), conf)
+  val root = new Path(location)
+  if (!fs.exists(root)) DiskState(Seq.empty, Seq.empty, 0)
+  else {
+    val parts = ls(fs, root).filter(st => st.isDirectory && !isProtected(st.getPath.getName))
+      .filter(st => splitKey(st.getPath.getName)._1.toLowerCase == HIVE_PARTITION_COL)
+    val wrong = parts.filter(st => splitKey(st.getPath.getName)._1 != PARTITION_COL)
+                     .map(_.getPath.toString).toSeq
+    val right = parts.count(st => splitKey(st.getPath.getName)._1 == PARTITION_COL)
+    val nested = parts.flatMap { st =>
+      ls(fs, st.getPath)
+        .filter(c => c.isDirectory &&
+                     splitKey(c.getPath.getName)._1.toLowerCase == HIVE_PARTITION_COL)
+        .map(_.getPath.toString)
+    }.toSeq
+    DiskState(wrong, nested, right)
+  }
+}.toOption
+
 val targets  = ArrayBuffer[Target]()
 val outOf    = ArrayBuffer[(String, String)]()   // (table, why)
 
@@ -284,15 +330,35 @@ allTables.foreach { t =>
           outOf += ((t, "MANAGED - DROP would delete the data, never touched"))
         else if (loc.trim.isEmpty)
           outOf += ((t, "no location in the catalog - refusing to work blind"))
-        else
-          targets += Target(t, loc, purge, meta.tableType.name)
+        else diskStateOf(loc) match {
+          case None =>
+            outOf += ((t, s"location $loc could not be listed - refusing to work blind"))
+          case Some(d) if !d.needsWork =>
+            // The whole point of the scope gate: the data is already laid out
+            // correctly, so this table gets NOTHING done to it -- no purge
+            // flip, no rename, no recreate.
+            val partCol0 = meta.properties.getOrElse("spark.sql.sources.schema.partCol.0", "")
+            val note =
+              if (partCol0 == PARTITION_COL)
+                s"all ${d.correct} partition dir(s) already '$PARTITION_COL=' and Spark " +
+                "agrees - nothing to do"
+              else
+                s"all ${d.correct} partition dir(s) already '$PARTITION_COL=' - nothing to " +
+                s"do here. NOTE: Spark's partCol.0 is '" +
+                (if (partCol0.isEmpty) "<unset>" else partCol0) + s"', so a future Spark " +
+                s"write would create '$HIVE_PARTITION_COL=' again; run " +
+                "recreate_table_partcol_runid.scala on it if that matters"
+            outOf += ((t, note))
+          case Some(d) =>
+            targets += Target(t, loc, purge, meta.tableType.name)
+        }
     }
   }
 }
 
 log("INFO", s"tables in $DB            : ${allTables.length}")
-log("INFO", s"partitioned by $HIVE_PARTITION_COL, in scope : ${targets.length}")
-log("INFO", s"out of scope             : ${outOf.length}")
+log("INFO", s"in scope (disk needs work): ${targets.length}")
+log("INFO", s"out of scope              : ${outOf.length}")
 
 targets.foreach(t => log("PLAN", s"IN SCOPE  $DB.${t.name}   ${t.location}"))
 if (outOf.nonEmpty) {
@@ -308,7 +374,7 @@ if (unknownOnly.nonEmpty)
               unknownOnly.toSeq.sorted.mkString(", ") + " - check for a typo")
 
 if (targets.isEmpty)
-  log("WARN", s"no table in $DB is partitioned by '$HIVE_PARTITION_COL' - nothing to do")
+  log("INFO", s"no table in $DB has a partition directory in the wrong case - nothing to do")
 
 // ---------------------------------------------------------------------
 // 5. Phase 0 -- make external.table.purge false before ANY drop
@@ -868,7 +934,7 @@ section(s"4/4  REPORT  (mode=$MODE)")
 println(s"database              : $DB")
 println(s"mode                  : $MODE")
 println(s"tables in $DB         : ${allTables.length}")
-println(s"in scope              : ${targets.length}")
+println(s"in scope (disk work)  : ${targets.length}")
 println(s"out of scope          : ${outOf.length}")
 println(s"phases                : rename=$DO_RENAME recreate=$DO_RECREATE")
 println(s"purge flipped to false: $cPurgeFlipped")

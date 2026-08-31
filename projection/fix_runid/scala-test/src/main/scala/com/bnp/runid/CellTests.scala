@@ -435,6 +435,30 @@ object CellTests {
     root
   }
 
+  /** A runid-partitioned table whose directories are ALREADY `runId=`. It is
+    * a Hive table, so Spark has no partCol.0 for it -- the case the batch
+    * leaves alone but reports. */
+  private def correctCaseTable(db: String, t: String, values: Seq[String],
+                               purge: Boolean): JPath = {
+    val root = newRoot(s"fixall-$t-")
+    values.foreach(v => writeOrcPartition(root, "runId", v, 1))
+    spark.sql(s"DROP TABLE IF EXISTS $db.$t")
+    spark.sql(
+      s"""CREATE EXTERNAL TABLE $db.$t (
+         |  `matrixMigrationName` string,
+         |  `asOfDate` string,
+         |  `scenario` string,
+         |  `notationCode` string)
+         |PARTITIONED BY (`runid` string)
+         |STORED AS ORC
+         |LOCATION '${uri(root)}'
+         |TBLPROPERTIES ('external.table.purge'='${purge.toString}')""".stripMargin)
+    values.foreach(v =>
+      spark.sql(s"ALTER TABLE $db.$t ADD IF NOT EXISTS PARTITION (runid='$v') " +
+                s"LOCATION '${uri(root)}/runId=$v'"))
+    root
+  }
+
   /** Directory names directly under a table root, sorted. */
   private def dirNames(root: JPath): Seq[String] = {
     val st = Files.list(root)
@@ -1296,6 +1320,90 @@ object CellTests {
                    "true", purgeOf(db, "other_key"))
       assertTrue("both must still exist", tableNames(db).contains("no_parts") &&
                                           tableNames(db).contains("other_key"))
+    }
+
+    // The scope gate: the DISK decides. A table already laid out correctly is
+    // not touched at all -- not renamed, not recreated, and not even its
+    // table properties.
+    check("a table already all runId= on disk is left completely alone") {
+      val db = "fixall_gate"
+      makeDb(db)
+      val root = correctCaseTable(db, "t_done", Seq("aaa1", "bbb2"), purge = true)
+      val before = tree(root)
+      val beforeLocs = partitionLocations(db, "t_done")
+      val out = Files.createTempDirectory("fixall-gate-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      }
+      assertFalse("it must not be in scope", log.contains("IN SCOPE  " + db + ".t_done"))
+      assertEquals("the tree must be untouched", before, tree(root))
+      assertEquals("the purge flag must be untouched", "true", purgeOf(db, "t_done"))
+      assertEquals("the partition locations must be untouched",
+                   beforeLocs, partitionLocations(db, "t_done"))
+      assertTrue("and the report must say why it was skipped",
+                 log.contains("already '" + "runId" + "='"))
+    }
+
+    // Left alone, but not left silent: with partCol.0 still 'runid' the next
+    // Spark write would recreate the problem, and the report has to say so.
+    check("an already-correct table with a stale partCol.0 is reported") {
+      val db = "fixall_gatenote"
+      makeDb(db)
+      correctCaseTable(db, "t_stale", Seq("aaa1"), purge = false)
+      val out = Files.createTempDirectory("fixall-gatenote-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "true"))
+      }
+      assertTrue("the report must name the stale partCol.0",
+                 log.contains("partCol.0"))
+      assertTrue("and must point at the single-table recreate cell",
+                 log.contains("recreate_table_partcol_runid.scala"))
+    }
+
+    // One wrong-case dir among correct ones is still work: the table is in
+    // scope and only that directory changes.
+    check("one wrong-case dir among correct ones puts the table in scope") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_mixed"
+      makeDb(db)
+      val root = correctCaseTable(db, "t_mixed", Seq("aaa1"), purge = true)
+      writeOrcPartition(root, "runid", "bbb2", 1)
+      spark.sql(s"ALTER TABLE $db.t_mixed ADD IF NOT EXISTS PARTITION (runid='bbb2') " +
+                s"LOCATION '${uri(root)}/runid=bbb2'")
+      val out = Files.createTempDirectory("fixall-mixed-")
+      generated.FixAllCell.run(spark, Map(
+        "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      assertEquals("both dirs must end up correct",
+                   Seq("runId=aaa1", "runId=bbb2"), dirNames(root))
+      assertEquals("no file may be lost", 2, tree(root).count(_.endsWith(".orc")))
+      assertEquals("both partitions must be registered", 2L,
+                   spark.sql(s"SHOW PARTITIONS $db.t_mixed").count())
+    }
+
+    // A nesting hiding under a CORRECT-case parent has no wrong-case dir at
+    // the top level, so the disk gate must look deeper or the defect would be
+    // silently skipped.
+    check("a nesting under a correct-case parent is still caught") {
+      val db = "fixall_gatenested"
+      makeDb(db)
+      val root = correctCaseTable(db, "t_hidden", Seq("aaa1"), purge = false)
+      val inner = root.resolve("runId=aaa1").resolve("runid=aaa1")
+      Files.createDirectories(inner)
+      val st = Files.list(root.resolve("runId=aaa1"))
+      val moved = try st.iterator().asScala.filter(Files.isRegularFile(_)).toVector
+                  finally st.close()
+      moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
+      val out = Files.createTempDirectory("fixall-gatenested-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      }
+      assertTrue("the table must not be skipped as already correct",
+                 log.contains("IN SCOPE  " + db + ".t_hidden"))
+      assertTrue("and must be reported as still nested", log.contains("STILL NESTED"))
+      assertTrue("with its data untouched", Files.exists(inner))
     }
 
     check("a second run is a clean no-op") {
