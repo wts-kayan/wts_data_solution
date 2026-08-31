@@ -1412,7 +1412,8 @@ object CellTests {
       moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
       val out = Files.createTempDirectory("fixall-nested-")
       val log = capturingStdout {
-        generated.FixAllCell.run(spark, cfg(db, out, dry = false))
+        generated.FixAllCell.run(spark,
+        cfg(db, out, dry = false) + ("DO_FLATTEN" -> "false"))
       }
       assertTrue("the nested dir must be left alone", Files.exists(inner))
       assertTrue("the run must say to flatten it first",
@@ -1441,7 +1442,7 @@ object CellTests {
       val out = Files.createTempDirectory("fixall-norename-")
       generated.FixAllCell.run(spark, Map(
         "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false",
-        "DO_RENAME" -> "false", "DO_RECREATE" -> "true"))
+        "DO_FLATTEN" -> "false", "DO_RENAME" -> "false", "DO_RECREATE" -> "true"))
       assertFalse("a nested table must not be recreated even with phase 1 off",
                   spark.table(s"$db.t_nested").schema.fieldNames.contains("runId"))
       assertTrue("and its data must still be where it was", Files.exists(inner))
@@ -1598,8 +1599,116 @@ object CellTests {
       }
       assertTrue("the table must not be skipped as already correct",
                  log.contains("IN SCOPE  " + db + ".t_hidden"))
-      assertTrue("and must be reported as still nested", log.contains("STILL NESTED"))
-      assertTrue("with its data untouched", Files.exists(inner))
+      // In scope is the point of this test: the gate has to see a nesting that
+      // has no wrong-case dir at the top level. Phase F then fixes it.
+      assertFalse("and phase F must flatten it", Files.exists(inner))
+      assertEquals("with the data promoted, not lost", 1,
+                   tree(root).count(_.endsWith(".orc")))
+      assertTrue("into the partition dir itself",
+                 Files.list(root.resolve("runId=aaa1")).iterator().asScala
+                      .exists(f => f.getFileName.toString.endsWith(".orc")))
+    }
+
+    // Phase F is the batch form of flatten_nested_runid_partitions.scala. A
+    // nested table used to be skipped with "run flatten first"; now one run
+    // takes it all the way.
+    check("a nested table is flattened and fully fixed in one run") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_flatten"
+      makeDb(db)
+      val root = runidTable(db, "t_nest", Seq("aaa1"))
+      val inner = root.resolve("runid=aaa1").resolve("runid=aaa1")
+      Files.createDirectories(inner)
+      val st = Files.list(root.resolve("runid=aaa1"))
+      val moved = try st.iterator().asScala.filter(Files.isRegularFile(_)).toVector
+                  finally st.close()
+      moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
+      val out = Files.createTempDirectory("fixall-flatten-")
+      generated.FixAllCell.run(spark, Map(
+        "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+
+      assertFalse("the nesting must be gone", Files.exists(inner))
+      assertEquals("and the dir re-cased", Seq("runId=aaa1"), dirNames(root))
+      assertEquals("with the data promoted, not lost", 1,
+                   tree(root).count(_.endsWith(".orc")))
+      assertTrue("Spark's schema must carry runId",
+                 spark.table(s"$db.t_nest").schema.fieldNames.contains("runId"))
+      assertEquals("and the row must read back", 1L, spark.table(s"$db.t_nest").count())
+    }
+
+    check("a stray folder inside a partition dir is cleared for every table") {
+      if (!caseSensitiveFs) throw Skip("filesystem is not case sensitive")
+      val db = "fixall_stray"
+      makeDb(db)
+      val r1 = runidTable(db, "t_one", Seq("aaa1"))
+      val r2 = runidTable(db, "t_two", Seq("bbb2"))
+      writeOrcPartition(r1.resolve("runid=aaa1"), "junk", "x", 1)
+      Files.createDirectories(r2.resolve("runid=bbb2").resolve("empty_leftover"))
+      val out = Files.createTempDirectory("fixall-stray-")
+      generated.FixAllCell.run(spark, Map(
+        "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      assertFalse("the folder holding data must be gone from table one",
+                  Files.exists(r1.resolve("runId=aaa1").resolve("junk=x")))
+      assertEquals("its data promoted, nothing lost", 2,
+                   tree(r1).count(_.endsWith(".orc")))
+      assertFalse("and the empty folder gone from table two",
+                  Files.exists(r2.resolve("runId=bbb2").resolve("empty_leftover")))
+    }
+
+    // The one nesting phase F refuses. Phase 2 must then still refuse the
+    // table, because its partitions would point at a depth holding no data.
+    check("a different run id is refused and blocks the recreate") {
+      val db = "fixall_mismatch"
+      makeDb(db)
+      val root = runidTable(db, "t_mm", Seq("aaa1"))
+      writeOrcPartition(root.resolve("runid=aaa1"), "runid", "zzz9", 1)
+      val out = Files.createTempDirectory("fixall-mismatch-")
+      val log = capturingStdout {
+        generated.FixAllCell.run(spark, Map(
+          "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false"))
+      }
+      assertTrue("the other run's dir must survive",
+                 Files.exists(root.resolve("runid=aaa1").resolve("runid=zzz9")) ||
+                 Files.exists(root.resolve("runId=aaa1").resolve("runid=zzz9")))
+      assertTrue("the refusal must be reported", log.contains("UUID MISMATCH"))
+      assertFalse("and the table must not have been recreated",
+                  spark.table(s"$db.t_mm").schema.fieldNames.contains("runId"))
+    }
+
+    check("DO_FLATTEN=false leaves the nesting, and still blocks the recreate") {
+      val db = "fixall_noflat"
+      makeDb(db)
+      val root = runidTable(db, "t_nest", Seq("aaa1"))
+      val inner = root.resolve("runid=aaa1").resolve("runid=aaa1")
+      Files.createDirectories(inner)
+      val st = Files.list(root.resolve("runid=aaa1"))
+      val moved = try st.iterator().asScala.filter(Files.isRegularFile(_)).toVector
+                  finally st.close()
+      moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
+      val out = Files.createTempDirectory("fixall-noflat-")
+      generated.FixAllCell.run(spark, Map(
+        "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "false",
+        "DO_FLATTEN" -> "false"))
+      assertTrue("the nesting must be left alone", Files.exists(inner))
+      assertFalse("and the table must not be recreated",
+                  spark.table(s"$db.t_nest").schema.fieldNames.contains("runId"))
+    }
+
+    check("DRY_RUN promotes nothing and deletes no folder") {
+      val db = "fixall_flatdry"
+      makeDb(db)
+      val root = runidTable(db, "t_nest", Seq("aaa1"))
+      val inner = root.resolve("runid=aaa1").resolve("runid=aaa1")
+      Files.createDirectories(inner)
+      val st = Files.list(root.resolve("runid=aaa1"))
+      val moved = try st.iterator().asScala.filter(Files.isRegularFile(_)).toVector
+                  finally st.close()
+      moved.foreach(f => Files.move(f, inner.resolve(f.getFileName.toString)))
+      val before = tree(root)
+      val out = Files.createTempDirectory("fixall-flatdry-")
+      generated.FixAllCell.run(spark, Map(
+        "DB" -> db, "OUTPUT_DIR" -> out.toUri.toString, "DRY_RUN" -> "true"))
+      assertEquals("the tree must be untouched", before, tree(root))
     }
 
     check("a second run is a clean no-op") {

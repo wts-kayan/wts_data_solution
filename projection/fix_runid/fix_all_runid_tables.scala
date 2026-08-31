@@ -24,16 +24,23 @@
 //  The batch form of the two single-table cells that have already been run
 //  successfully against dbprojection.term_structure:
 //
-//    rename_partitions_to_runId.scala   on-disk  runid=<X>  ->  runId=<X>
-//    recreate_table_partcol_runid.scala Spark's  partCol.0  ->  runId
+//    flatten_nested_runid_partitions.scala  no directory inside a partition dir
+//    rename_partitions_to_runId.scala      on-disk  runid=<X> -> runId=<X>
+//    recreate_table_partcol_runid.scala    Spark's  partCol.0 -> runId
 //
 //  It finds every table in the database partitioned by `runid` and applies
 //  the same two phases to each, in the same order, with the same guards.
 //  The single-table cells remain the right tool for one table; this one is
 //  for doing all of them without editing a config 60 times.
 //
-//  THE TWO PHASES, PER TABLE
-//  -------------------------
+//  THE THREE PHASES, PER TABLE
+//  ---------------------------
+//  Phase F FLATTEN  -- promotes every data file out of any directory sitting
+//                      inside a partition directory, at any depth, then
+//                      deletes the emptied tree. Covers the
+//                      runId=<X>/runid=<X> nesting and any other stray folder.
+//                      Refuses a <key>=<other uuid> directory and a protected
+//                      one, and reports both.
 //  Phase 1 RENAME   -- renames each on-disk `runid=<X>` directory to
 //                      `runId=<X>` and re-points the metastore partition at
 //                      the new path. Where both casings already exist the
@@ -89,9 +96,9 @@
 //  completely alone. The flag is not put back: phase 2 recreates the table
 //  without it, which is both safer and what the drop workflow wants.
 //
-//  A table still carrying the double-nested `runId=<X>/runid=<X>/` defect is
-//  SKIPPED, not guessed at -- run flatten_nested_runid_partitions.scala on
-//  it first, then re-run this cell.
+//  A table still carrying a nesting AFTER phase F -- which only happens for
+//  the two refused cases above -- is skipped by phase 2 and reported, because
+//  registering its partitions would point them at a depth that holds no data.
 //
 //  SAFETY
 //  ------
@@ -134,7 +141,9 @@ val PARTITION_COL      = "runId"
 val PARTITION_TYPE     = "string"
 val HIVE_PARTITION_COL = PARTITION_COL.toLowerCase
 
-// Phases. Both default on; turn one off to do a pass of just that phase.
+// Phases. All default on; turn the others off to do a pass of just one --
+// DO_FLATTEN alone is the batch form of flatten_nested_runid_partitions.scala.
+val DO_FLATTEN  = true
 val DO_RENAME   = true
 val DO_RECREATE = true
 
@@ -443,7 +452,121 @@ def ensurePurgeFalse(t: Target): Boolean = {
 }
 
 // ---------------------------------------------------------------------
-// 6. Phase 1 -- rename runid=<X> to runId=<X>, per table
+// 6. Phase F -- flatten: no directory inside a partition directory
+//
+// The batch form of flatten_nested_runid_partitions.scala. A partition
+// directory holds FILES; any directory inside one is left over from the writer
+// defect. Every data file is promoted out of it, at any depth, and the emptied
+// tree is deleted -- which is exactly what the single-table cell's
+// sub-directory pass does, and it covers the runId=<X>/runid=<X> nesting the
+// same way.
+//
+// It runs BEFORE the rename, so phase 1 sees flat partition directories and
+// phase 2 registers partitions at a depth that actually holds data.
+//
+// Two directories are refused rather than removed, both reported:
+//   * <key>=<other uuid> -- promoting it would merge two distinct runs;
+//   * a protected directory (.hive-staging, _temporary) -- a write may still
+//     be running.
+// ---------------------------------------------------------------------
+
+case class FlattenResult(promoted: Int, dirsDeleted: Int,
+                         refused: Seq[(String, String)], failed: Int)
+
+def flattenOneTable(t: Target): FlattenResult = {
+  val fq = s"$DB.${t.name}"
+  val fs = FileSystem.get(new URI(t.location), conf)
+  val root = new Path(t.location)
+  if (!fs.exists(root))
+    return FlattenResult(0, 0, Seq((t.location, "table root does not exist")), 1)
+
+  /** Every non-protected FILE under `dir`, at any depth. */
+  def filesUnder(dir: Path): Seq[org.apache.hadoop.fs.FileStatus] = {
+    val out = ArrayBuffer[org.apache.hadoop.fs.FileStatus]()
+    def walk(d: Path): Unit = ls(fs, d).foreach { st =>
+      if (st.isDirectory) { if (!isProtected(st.getPath.getName)) walk(st.getPath) }
+      else if (!isProtected(st.getPath.getName)) out += st
+    }
+    Try(walk(dir))
+    out.toSeq
+  }
+
+  var promoted = 0
+  var deleted  = 0
+  var failed   = 0
+  val refused  = ArrayBuffer[(String, String)]()
+
+  val partitionDirs = ls(fs, root).filter { st =>
+    st.isDirectory && !isProtected(st.getPath.getName) &&
+    splitKey(st.getPath.getName)._1.toLowerCase == HIVE_PARTITION_COL
+  }
+
+  partitionDirs.foreach { pd =>
+    val pdPath  = pd.getPath
+    val pdValue = splitKey(pdPath.getName)._2.getOrElse("")
+
+    ls(fs, pdPath).filter(_.isDirectory).foreach { sub =>
+      val subPath = sub.getPath
+      val subName = subPath.getName
+      val (subKey, subValOpt) = splitKey(subName)
+
+      if (isProtected(subName)) {
+        refused += ((subPath.toString,
+          "protected directory - a write may still be running, left untouched"))
+      } else if (subKey.toLowerCase == HIVE_PARTITION_COL && subValOpt.isDefined &&
+                 subValOpt.get.toLowerCase != pdValue.toLowerCase) {
+        refused += ((subPath.toString,
+          s"UUID MISMATCH: '$subName' inside '${pdPath.getName}' - promoting it would " +
+          "merge two distinct runs, never guessed"))
+      } else {
+        val data  = filesUnder(subPath)
+        val bytes = data.map(_.getLen).sum
+        log("PLAN", s"  PROMOTE ${data.length} file(s) (${human(bytes)}) out of $subPath, " +
+                    "then DELETE it")
+        if (!DRY_RUN) {
+          var ok = true
+          data.foreach { st =>
+            val src = st.getPath
+            var dst = new Path(pdPath, src.getName)
+            if (fs.exists(dst)) {
+              val short = UUID.randomUUID().toString.replaceAll("-", "").substring(0, 8)
+              dst = new Path(pdPath, "merged_" + short + "_" + src.getName)
+              log("WARN", s"  collision on ${src.getName} -> ${dst.getName}")
+            }
+            if (fs.rename(src, dst)) { promoted += 1; log("OK", s"  MOVE   $src -> $dst") }
+            else { ok = false; failed += 1; log("ERROR", s"  MOVE FAILED $src -> $dst") }
+          }
+          if (!ok) {
+            refused += ((subPath.toString,
+              "at least one file could not be promoted - directory KEPT, no data lost"))
+          } else if (Try(filesUnder(subPath)).getOrElse(Seq.empty).nonEmpty) {
+            refused += ((subPath.toString,
+              "data appeared since the promotion - directory KEPT"))
+          } else if (fs.delete(subPath, true)) {
+            deleted += 1
+            log("OK", s"  DELETE $subPath   (emptied sub-directory)")
+          } else {
+            failed += 1
+            log("ERROR", s"  DELETE FAILED $subPath")
+          }
+        }
+      }
+    }
+  }
+
+  if (promoted == 0 && deleted == 0 && refused.isEmpty)
+    log("OK", s"$fq : no directory sits inside a partition directory")
+  else
+    log("INFO", s"$fq : promoted=$promoted dirs_deleted=$deleted " +
+                s"refused=${refused.length} failures=$failed")
+  refused.foreach { case (sp, why) => log("WARN", s"  KEPT $sp : $why") }
+
+  if (!DRY_RUN && (promoted > 0 || deleted > 0)) Try(spark.catalog.refreshByPath(t.location))
+  FlattenResult(promoted, deleted, refused.toSeq, failed)
+}
+
+// ---------------------------------------------------------------------
+// 7. Phase 1 -- rename runid=<X> to runId=<X>, per table
 // ---------------------------------------------------------------------
 
 case class RenameResult(renamed: Int, merged: Int, filesMoved: Int, dirsDeleted: Int,
@@ -655,7 +778,7 @@ def renameOneTable(t: Target): RenameResult = {
 }
 
 // ---------------------------------------------------------------------
-// 7. Phase 2 -- recreate so Spark's partCol.0 carries the camelCase
+// 8. Phase 2 -- recreate so Spark's partCol.0 carries the camelCase
 // ---------------------------------------------------------------------
 
 /** `failed` separates a refusal that needs attention (no backup, unreadable
@@ -820,12 +943,13 @@ def recreateOneTable(t: Target): RecreateResult = {
 }
 
 // ---------------------------------------------------------------------
-// 8. The loop
+// 9. The loop
 // ---------------------------------------------------------------------
 
-section(s"2/4  PHASE 0+1+2 PER TABLE  (mode=$MODE)")
+section(s"2/4  PHASE 0+F+1+2 PER TABLE  (mode=$MODE)")
 
-case class Outcome(table: String, renamed: Int, merged: Int, filesMoved: Int,
+case class Outcome(table: String, promoted: Int, subdirsDeleted: Int,
+                   renamed: Int, merged: Int, filesMoved: Int,
                    repointed: Int, recreated: Boolean, recreateWhy: String,
                    partitions: Int, failed: Int, nested: Int)
 
@@ -835,6 +959,7 @@ targets.foreach { t =>
   val fq = s"$DB.${t.name}"
   subsection(s"$fq   (${t.tableType}, location ${t.location})")
 
+  var fl  = FlattenResult(0, 0, Seq.empty, 0)
   var ren = RenameResult(0, 0, 0, 0, 0, 0, Seq.empty, Seq.empty)
   var rc = RecreateResult(false, "DO_RECREATE=false", 0)
   var hardFail = false
@@ -845,6 +970,15 @@ targets.foreach { t =>
     hardFail = true
     rc = RecreateResult(false, "external.table.purge could not be verified false - " +
                                "nothing was done to this table", 0, failed = true)
+  }
+
+  // Phase F before phase 1: the rename wants flat partition directories, and
+  // phase 2 must register partitions at a depth that actually holds data.
+  if (!hardFail && DO_FLATTEN) {
+    Try(fl = flattenOneTable(t)).failed.foreach { e =>
+      hardFail = true
+      log("ERROR", s"$fq : phase F failed: ${e.getMessage}")
+    }
   }
 
   if (!hardFail && DO_RENAME) {
@@ -880,18 +1014,20 @@ targets.foreach { t =>
     }
   }
 
-  outcomes += Outcome(t.name, ren.renamed, ren.merged, ren.filesMoved, ren.repointed,
+  outcomes += Outcome(t.name, fl.promoted, fl.dirsDeleted,
+                      ren.renamed, ren.merged, ren.filesMoved, ren.repointed,
                       rc.done, rc.why, rc.partitions,
-                      ren.failed + (if (hardFail) 1 else 0) + (if (rc.failed) 1 else 0),
+                      ren.failed + fl.failed + (if (hardFail) 1 else 0) +
+                        (if (rc.failed) 1 else 0),
                       nestedNow.length)
 
-  if (STOP_ON_FAILURE && (hardFail || ren.failed > 0 || rc.failed))
+  if (STOP_ON_FAILURE && (hardFail || ren.failed > 0 || fl.failed > 0 || rc.failed))
     sys.error(s"ABORT: $fq failed and STOP_ON_FAILURE=true. " +
               s"${outcomes.length} table(s) had been processed.")
 }
 
 // ---------------------------------------------------------------------
-// 9. Verification
+// 10. Verification
 // ---------------------------------------------------------------------
 
 section(s"3/4  VERIFICATION  (mode=$MODE)")
@@ -926,7 +1062,7 @@ if (DRY_RUN) {
 }
 
 // ---------------------------------------------------------------------
-// 10. Report
+// 11. Report
 // ---------------------------------------------------------------------
 
 section(s"4/4  REPORT  (mode=$MODE)")
@@ -936,7 +1072,10 @@ println(s"mode                  : $MODE")
 println(s"tables in $DB         : ${allTables.length}")
 println(s"in scope (disk work)  : ${targets.length}")
 println(s"out of scope          : ${outOf.length}")
-println(s"phases                : rename=$DO_RENAME recreate=$DO_RECREATE")
+println(s"phases                : flatten=$DO_FLATTEN rename=$DO_RENAME " +
+        s"recreate=$DO_RECREATE")
+println(s"files promoted out of subdirs: ${outcomes.map(_.promoted).sum}")
+println(s"subdirs deleted       : ${outcomes.map(_.subdirsDeleted).sum}")
 println(s"purge flipped to false: $cPurgeFlipped")
 println(s"dirs renamed          : ${outcomes.map(_.renamed).sum}")
 println(s"dirs merged           : ${outcomes.map(_.merged).sum}")
