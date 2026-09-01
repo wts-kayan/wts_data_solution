@@ -11,8 +11,9 @@ checked — run both versions, compare every field with exact equality, no epsil
 ## Run
 
 ```bash
-./run.sh            # 200,000 facilities
-./run.sh 1000000    # more
+./run.sh                      # 200,000 facilities, default seed
+./run.sh 2000000              # more facilities
+./run.sh 300000 424242        # a different population
 ```
 
 Exit code 0 means bit-identical, 1 means a difference was found.
@@ -50,7 +51,21 @@ a population that never reached the dirty or zero-EAD branches would prove
 nothing, so the harness reports INCONCLUSIVE rather than success if any branch
 was missed.
 
-## The harness detects the failure it is meant to detect
+## Runs
+
+| Facilities | Seed | Result |
+|---|---|---|
+| 200,000 | 20260901 | 0 mismatches |
+| 2,000,000 | 20260901 | 0 mismatches |
+| 300,000 | 1 | 0 mismatches |
+| 300,000 | 7 | 0 mismatches |
+| 300,000 | 424242 | 0 mismatches |
+| 300,000 | 987654321 | 0 mismatches |
+
+The seed is an argument for a reason: a single fixed one only ever proves the
+refactoring is equivalent on one sequence of draws.
+
+## The harness detects the failures it is meant to detect
 
 A green run is only worth something if a red one is possible. Fusing the loops
 the obvious way — keeping a single `continue` for dirty ratings — gives:
@@ -65,6 +80,23 @@ That is the trap sub-task 7 warns about, and acceptance test 4 of that sub-task
 is what catches it in review. `-99.0` is the sentinel the model seeds
 `crr3_irb_rwa` with: the naive fusion never wrote the field at all, and a
 zero-initialised stub would have hidden that behind a matching `0.0`.
+
+**Second control — the `* 0.08` substitution the parent ticket forbids.**
+Replacing every `/ RATIO_CAPITAL_TO_RWA` with `* 0.08`, which is the same number
+in decimal, gives:
+
+```
+facility-level mismatches: 58,369
+rating-level mismatches  : 94,536
+  facility[2].crr3_irb_capital : original=1984.087765417187 refactored=1984.0877654171873
+  facility[3].crr3_irb_secured_capital : original=581.3383818821881 refactored=581.3383818821882
+```
+
+One digit in the seventeenth significant figure, on 58,369 facilities. That is
+the whole argument for the rule: `1/12.5` is exactly representable in binary
+floating point and `0.08` is not, so the two differ in the last bits. On an
+audited regulatory figure that is a defect, and it is exactly the kind of change
+that looks free in review.
 
 ## What this does and does not prove
 

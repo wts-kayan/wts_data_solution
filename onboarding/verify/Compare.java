@@ -13,7 +13,7 @@ import java.util.Random;
  * ticket is really asking: is the refactoring described in sub-tasks 1 to 7
  * actually behaviour-preserving, including the awkward branches?
  *
- *   javac -d out *.java && java -cp out Compare
+ *   javac -d out *.java && java -cp out Compare [facilities] [seed]
  */
 public final class Compare {
 
@@ -87,7 +87,11 @@ public final class Compare {
 
     public static void main(String[] args) {
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 200_000;
-        Random rnd = new Random(20260901L);
+        // Seed is an argument so the check can be repeated over different
+        // populations. A single fixed seed only ever proves the refactoring is
+        // equivalent on one sequence of draws.
+        long seed = args.length > 1 ? Long.parseLong(args[1]) : 20260901L;
+        Random rnd = new Random(seed);
 
         int facilitiesCompared = 0;
         int ratingsCompared = 0;
@@ -100,28 +104,28 @@ public final class Compare {
             zeroEad = 0, zeroRatio = 0;
 
         for (int i = 0; i < n; i++) {
-            Facility seed = generate(rnd, i);
+            Facility input = generate(rnd, i);
 
-            boolean guard1 = seed.getApproche_bale_iv_rwa() != null
-                    && seed.getApproche_bale_iv_rwa() != Crr3Approach.IRBA
-                    && seed.getApproche_bale_iv_rwa() != Crr3Approach.IRBF;
-            boolean guard2 = !guard1 && seed.getfMeasurement().getMeasurementsByRating().values()
+            boolean guard1 = input.getApproche_bale_iv_rwa() != null
+                    && input.getApproche_bale_iv_rwa() != Crr3Approach.IRBA
+                    && input.getApproche_bale_iv_rwa() != Crr3Approach.IRBF;
+            boolean guard2 = !guard1 && input.getfMeasurement().getMeasurementsByRating().values()
                     .stream().noneMatch(m -> m.getUnpaid() != null && m.getUnpaid().isClean());
             if (guard1) earlyGuard1++;
             else if (guard2) earlyGuard2++;
             else processed++;
 
-            for (MeasurementsOfRating m : seed.getfMeasurement().getMeasurementsByRating().values()) {
+            for (MeasurementsOfRating m : input.getfMeasurement().getMeasurementsByRating().values()) {
                 if (m.isDirty()) dirtyRatings++;
                 if (m.getEadReg() == 0) zeroEad++;
             }
-            if (seed.getCrr3_irba_per_unsecured_ead() == 0.0
-                    || seed.getCcr3_irba_secured_ead_ratio() == 0.0
-                    || seed.getCrr3_irbf_per_unsecured_ead() == 0.0
-                    || seed.getCcr3_irbf_secured_ead_ratio() == 0.0) zeroRatio++;
+            if (input.getCrr3_irba_per_unsecured_ead() == 0.0
+                    || input.getCcr3_irba_secured_ead_ratio() == 0.0
+                    || input.getCrr3_irbf_per_unsecured_ead() == 0.0
+                    || input.getCcr3_irbf_secured_ead_ratio() == 0.0) zeroRatio++;
 
-            Facility before = StepOriginal.execute(seed.copy());
-            Facility after  = StepRefactored.execute(seed.copy());
+            Facility before = StepOriginal.execute(input.copy());
+            Facility after  = StepRefactored.execute(input.copy());
 
             facilitiesCompared++;
             double[] bf = facilityValues(before), af = facilityValues(after);
@@ -162,6 +166,7 @@ public final class Compare {
         System.out.println("=".repeat(78));
         System.out.println("StepCrr3IrbRwaCompute -- original vs refactored, exact comparison");
         System.out.println("=".repeat(78));
+        System.out.printf("seed                     : %d%n", seed);
         System.out.printf("facilities compared      : %,d%n", facilitiesCompared);
         System.out.printf("rating rows compared     : %,d%n", ratingsCompared);
         System.out.printf("facility fields per row  : %d%n", FACILITY_FIELDS.length);
