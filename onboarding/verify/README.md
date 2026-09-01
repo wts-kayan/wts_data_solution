@@ -8,6 +8,23 @@ This exists to answer one question: *is the refactoring the tickets describe
 actually behaviour-preserving?* It is checked the way the tickets demand it be
 checked — run both versions, compare every field with exact equality, no epsilon.
 
+## Java version
+
+The engine builds on **Java 8**, so these sources are Java 8 compatible and are
+kept that way. Verify it rather than trust it:
+
+```bash
+javac --release 8 -d out8 *.java     # on a JDK 9+ toolchain
+javac -d out *.java                  # on a JDK 8 toolchain
+```
+
+Nothing here uses a Java 9+ API. `String.repeat` did, once, and `--release 8`
+is what caught it — hence `rule(int)` in `Compare.java`.
+
+Everything the tickets ask for is Java 8 too: `noneMatch` and lambdas are Java 8,
+`Math.min`/`Math.max` predate it, and sub-task 6 asks for an explicit
+`Collection<MeasurementsOfRating>` rather than `var`, which would need Java 10.
+
 ## Run
 
 ```bash

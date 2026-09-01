@@ -47,6 +47,14 @@ public final class Compare {
         };
     }
 
+    /** Java 8 has no String.repeat. This harness has to compile on the same JDK
+      * as the engine it is checking, which is 8. */
+    private static String rule(int n) {
+        char[] c = new char[n];
+        java.util.Arrays.fill(c, '=');
+        return new String(c);
+    }
+
     /** Bit-level equality. Double.compare so that -0.0 != 0.0 and NaN == NaN,
       * which `==` would get wrong in both directions. */
     private static boolean same(double a, double b) {
@@ -163,9 +171,9 @@ public final class Compare {
             }
         }
 
-        System.out.println("=".repeat(78));
+        System.out.println(rule(78));
         System.out.println("StepCrr3IrbRwaCompute -- original vs refactored, exact comparison");
-        System.out.println("=".repeat(78));
+        System.out.println(rule(78));
         System.out.printf("seed                     : %d%n", seed);
         System.out.printf("facilities compared      : %,d%n", facilitiesCompared);
         System.out.printf("rating rows compared     : %,d%n", ratingsCompared);
@@ -189,7 +197,7 @@ public final class Compare {
             firstFailures.forEach(l -> System.out.println("  " + l));
         }
 
-        System.out.println("=".repeat(78));
+        System.out.println(rule(78));
         boolean ok = facilityMismatches == 0 && ratingMismatches == 0
                 && processed > 0 && dirtyRatings > 0 && zeroEad > 0
                 && earlyGuard1 > 0 && earlyGuard2 > 0;
