@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.bnpparibas.ilt.fresh.str</groupId>
+    <artifactId>str-circe-var-macro-generator</artifactId>
+    <version>2.2.2-RELEASE</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <java.version>1.8</java.version>
+        <scala.version>2.12.18</scala.version>
+        <scalatest.version>3.2.18</scalatest.version>
+        <spark.version>3.5.4</spark.version>
+        <spark-scala.version>2.12</spark-scala.version>
+        <junit.version>3.8.1</junit.version>
+        <maven.version>3.5.1</maven.version>
+        <maven-assembly-plugin.version>3.3.0</maven-assembly-plugin.version>
+        <scala-maven-plugin.version>3.3.1</scala-maven-plugin.version>
+
+        <sonar.jacoco.reportPath>target/jacoco.exec</sonar.jacoco.reportPath>
+        <sonar.jacoco.outReportPath>target/jacoco</sonar.jacoco.outReportPath>
+        <sonar.jacoco.itReportPath>target/jacoco-it.exec</sonar.jacoco.itReportPath>
+        <sonar.jacoco.outItReportPath>target/jacoco-it</sonar.jacoco.outItReportPath>
+        <sonar.coverage.jacoco.xmlReportPaths>target/jacoco/jacoco.xml</sonar.coverage.jacoco.xmlReportPaths>
+        <sonar.exclusions>src/test/**,target/**</sonar.exclusions>
+
+        <slf4j-api.version>2.0.7</slf4j-api.version>
+        <log4j.version>2.20.0</log4j.version>
+    </properties>
+
+    <dependencies>
+
+        <!-- SCALA -->
+        <dependency>
+            <groupId>org.scala-lang</groupId>
+            <artifactId>scala-library</artifactId>
+            <version>${scala.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- SPARK -->
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-core_${spark-scala.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${spark-scala.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-hive_${spark-scala.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- TO READ EXCEL -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>4.1.2</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.googlecode.json-simple</groupId>
+            <artifactId>json-simple</artifactId>
+            <version>1.1.1</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.renjin</groupId>
+            <artifactId>renjin-script-engine</artifactId>
+            <version>3.5-beta76</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-jdk14</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- LOGS
+             Exactly ONE SLF4J binding may be on the classpath. Spark already
+             supplies slf4j-api + log4j-slf4j2-impl + log4j-core at the versions
+             below, so everything here is `provided`: declaring it compile-scoped
+             is what put a second copy inside the assembly jar. See ANALYSIS.md.
+
+             Do NOT add slf4j-log4j12 (relocates to slf4j-reload4j, a 2nd binding)
+             and do NOT add log4j-slf4j-impl (the slf4j 1.7 binding; the slf4j 2.x
+             one is log4j-slf4j2-impl). -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j-api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-slf4j2-impl</artifactId>
+            <version>${log4j.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <version>${log4j.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- MATRIX -->
+        <dependency>
+            <groupId>org.scalanlp</groupId>
+            <artifactId>breeze_${spark-scala.version}</artifactId>
+            <version>1.2</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- TEST -->
+        <dependency>
+            <groupId>org.scalatest</groupId>
+            <artifactId>scalatest_${spark-scala.version}</artifactId>
+            <version>${scalatest.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+
+        <sourceDirectory>src/main/scala</sourceDirectory>
+        <testSourceDirectory>src/test/scala</testSourceDirectory>
+
+        <plugins>
+
+            <!-- plugin for packagin -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>${maven-assembly-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>bigData-assembly</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <addClasspath>true</addClasspath>
+                            <mainClass>com.bnpparibas.ilt.fresh.str.Circe</mainClass>
+                        </manifest>
+                    </archive>
+                    <descriptorRefs>
+                        <descriptorRef>jar-with-dependencies</descriptorRef>
+                    </descriptorRefs>
+                    <appendAssemblyId>false</appendAssemblyId>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven.version}</version>
+                <configuration>
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                </configuration>
+            </plugin>
+
+            <!-- scala -->
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>${scala-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>
+                            <goal>testCompile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <scalaVersion>${scala.version}</scalaVersion>
+                </configuration>
+            </plugin>
+
+            <!-- disable surefire -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>2.22.0</version>
+                <executions>
+                    <execution>
+                        <id>default-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>test</goal>
+                        </goals>
+                        <configuration>
+                            <includes>
+                                <include>**/*Test.scala</include>
+                            </includes>
+                            <argLine>-Xmx1024m</argLine>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>2.22.1</version>
+                <configuration>
+                    <includes>
+                        <include>**/*IT.scala</include>
+                    </includes>
+                    <reportsDirectory>${project.build.directory}/surefire-reports</reportsDirectory>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>failsafe-integration-tests</id>
+                        <phase>integration-test</phase>
+                        <goals>
+                            <goal>integration-test</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- enable scalatest -->
+            <plugin>
+                <groupId>org.scalatest</groupId>
+                <artifactId>scalatest-maven-plugin</artifactId>
+                <version>1.0</version>
+                <configuration>
+                    <parallel>true</parallel>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>test</id>
+                        <goals>
+                            <goal>test</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+        </plugins>
+    </build>
+
+</project>
