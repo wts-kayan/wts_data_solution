@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<workflow-app xmlns="uri:oozie:workflow:1.0" name="Projection">
+	<credentials>
+		<credential name="hcat" type="hcat">
+			<property>
+				<name>hcat.metastore.uri</name>
+				<value>thrift://${hiveMetastoreHost}:9083</value>
+			</property>
+			<property>
+				<name>hcat.metastore.principal</name>
+				<value>hive/${hiveMetastoreHost}@${kerberosRealm}</value>
+			</property>
+		</credential>
+	</credentials>
+	<start to="spark-4f31"/>
+	<kill name="Kill">
+		<message>Action failed, error message[${wf:errorMessage(wf:lastErrorNode())}]</message>
+	</kill>
+	<action cred="hcat" name="spark-4f31">
+		<spark3 xmlns="uri:oozie:spark3-action:1.0">
+			<resource-manager>${resourceManagerHost}:8032</resource-manager>
+			<name-node>${nameNode}</name-node>
+			<master>yarn</master>
+			<mode>cluster</mode>
+			<name>${runName}</name>
+			<class>com.bnpp.itg.fresh.str.runners.impl.RunProjection</class>
+			<jar>${nameNode}/Projects/${project}/${area}/Projection/BigDataJar/str_projection_engine-7.8.2-RELEASE.jar</jar>
+			<spark-opts>--queue StEngine --executor-memory=27g --executor-cores=3 --driver-memory=27g --driver-cores=3 --conf spark.dynamicAllocation.initialExecutors=1
+			--conf spark.dynamicAllocation.minExecutors=1 --conf spark.dynamicAllocation.maxExecutors=10 --conf spark.dynamicAllocation.enabled=true
+			--conf spark.shuffle.service.enabled=true --conf spark.executor.extraJavaOptions=-Dlog4j2.configuration=log4j2.properties
+			--conf spark.driver.extraJavaOptions=-Dlog4j2.configuration=log4j2.properties --conf spark.yarn.maxAppAttempts=1
+			--conf spark.hadoop.hive.exec.dynamic.partition.mode=nonstrict --conf spark.hadoop.hive.exec.dynamic.partition=true</spark-opts>
+			<arg>/Projects/${project}/${env}/Projection_Conf_Files/${runName}/conf.properties</arg>
+			<arg>/Projects/${project}/${env}/Projection_Conf_Files/${runName}
+			/workflow-projection.xml</arg>
+			<file>${nameNode}/Projects/${projectUat}/log4j.properties#log4j.properties</file>
+		</spark3>
+		<ok to="End"/>
+		<error to="Kill"/>
+	</action>
+	<end name="End"/>
+</workflow-app>

@@ -1,0 +1,320 @@
+=====================================================================
+REDACTION LEGEND — this file has been scrubbed for a public repository
+=====================================================================
+  <host-a>        Hive metastore + Oozie server (callback target)
+  <host-b>        YARN ResourceManager
+  <host-c>        NodeManager that ran the launcher container
+  <host-vip>      Oozie HA VIP
+  <knox-host>     Knox gateway serving the job-history UI
+  <REALM>         Kerberos realm
+  <user>          submitting Unix / HDFS user
+  <app-id>        YARN application id
+  <container-id>  YARN container id
+  <wf-id>         Oozie workflow id
+  <oozie-tag>     Oozie child-job tag
+  <nameservice>   HDFS HA nameservice
+  <project>, <env>, <area>, <project-uat>, <run-name>
+                  HDFS project paths and the run label
+
+workflow-projection.xml carries the same redactions, written as
+${project}, ${runName}, ${hiveMetastoreHost}, ${kerberosRealm} ...
+so the file stays well-formed XML.
+
+Kept deliberately, because the diagnosis depends on them: versions
+(Spark, CDH parcel, JDK), package and class names, stack traces,
+spark-opts, and the YARN queue name.
+=====================================================================
+
+=====================================================================
+VERBATIM EXTRACTION — Oozie Launcher AM container log
+Source : https://<knox-host>/gateway/cdp-proxy/
+         jobhistory/joblogs/<host-c>:8041/
+         container_<container-id>/container_<container-id>...
+Photos : 4 screenshots (photo.jpeg x4)
+Note   : lines running past the right edge of the viewport are marked
+         ⟪TRUNCATED-VIEWPORT⟫ — no content is fabricated past that point.
+=====================================================================
+
+
+--- [PHOTO 1] --------------------------------------------------------
+
+------------------------
+#
+#Thu Sep 10 22:24:30 CEST 2026
+java.runtime.name=Java(TM) SE Runtime Environment
+sun.boot.library.path=/usr/lib/jvm/jdk1.8.0_241/jre/lib/amd64
+java.vm.version=25.241-b07
+hadoop.root.logger=INFO,CLA
+java.vm.vendor=Oracle Corporation
+java.vendor.url=http\://java.oracle.com/
+log4j1.compatibility=true
+path.separator=\:
+java.vm.name=Java HotSpot(TM) 64-Bit Server VM
+file.encoding.pkg=sun.io
+user.country=GB
+sun.java.launcher=SUN_STANDARD
+sun.os.patch.level=unknown
+java.vm.specification.name=Java Virtual Machine Specification
+user.dir=/hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>
+java.runtime.version=1.8.0_241-b07
+java.awt.graphicsenv=sun.awt.X11GraphicsEnvironment
+java.endorsed.dirs=/usr/lib/jvm/jdk1.8.0_241/jre/lib/endorsed
+os.arch=amd64
+yarn.app.container.log.dir=/hadoop/yarn/nm/logs/application_<app-id>/container_<container-id>
+java.io.tmpdir=/tmp
+line.separator=\n
+java.vm.specification.vendor=Oracle Corporation
+os.name=Linux
+log4j.configuration=container-log4j.properties
+sun.jnu.encoding=UTF-8
+java.library.path=\:/usr/java/packages/lib/amd64\:/usr/lib64\:/lib64\:/lib\:/usr/lib
+java.specification.name=Java Platform API Specification
+java.class.version=52.0
+java.net.preferIPv4Stack=true
+sun.management.compiler=HotSpot 64-Bit Tiered Compilers
+os.version=4.18.0-553.111.1.el8_10.x86_64
+hadoop.root.logfile=syslog
+yarn.app.container.log.filesize=1048576
+user.home=/home/<user>
+user.timezone=Europe/Paris
+java.awt.printerjob=sun.print.PSPrinterJob
+file.encoding=UTF-8
+java.specification.version=1.8
+submitter.user=<user>
+log4j.debug=true
+java.class.path=/hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>\:/hadoop/yarn/nm/usercache/<user>/appcache/application_⟪TRUNCATED-VIEWPORT⟫
+user.name=<user>
+java.vm.specification.version=1.8
+sun.java.command=org.apache.oozie.action.hadoop.LauncherAM
+java.home=/usr/lib/jvm/jdk1.8.0_241/jre
+sun.arch.data.model=64
+user.language=en
+java.specification.vendor=Oracle Corporation
+awt.toolkit=sun.awt.X11.XToolkit
+java.vm.info=mixed mode
+java.version=1.8.0_241
+java.ext.dirs=/usr/lib/jvm/jdk1.8.0_241/jre/lib/ext\:/usr/java/packages/lib/ext
+sun.boot.class.path=/usr/lib/jvm/jdk1.8.0_241/jre/lib/resources.jar\:/usr/lib/jvm/jdk1.8.0_241/jre/lib/rt.jar\:/usr/lib/jvm/jdk1.8.0_241/jre/lib/sunrsasign.jar\:/usr/lib/jvm/jdk1.8.0_241/jr⟪TRUNCATED-VIEWPORT⟫
+java.vendor=Oracle Corporation
+org.omg.PortableInterceptor.ORBInitializerClass.org.omg.PortableInterceptor.RuxitOrbInitializer=
+file.separator=/
+
+
+--- [PHOTO 2] --------------------------------------------------------
+
+file.separator=/
+java.vendor.url.bug=http\://bugreport.sun.com/bugreport/
+sun.io.unicode.encoding=UnicodeLittle
+sun.cpu.endian=little
+Xmx=819
+sun.cpu.isalist=
+------------------------
+
+Environment variables
+------------------------
+PATH=/usr/local/bin:/usr/bin
+HADOOP_CONF_DIR=/etc/hadoop/conf.cloudera.YARN-1
+JAVA_HOME=/usr/lib/jvm/jdk1.8.0_241
+LANG=en_GB.UTF-8
+APP_SUBMIT_TIME_ENV=1789071863848
+NM_HOST=<host-c>
+SPARK_HOME=.
+LD_LIBRARY_PATH=
+HADOOP_HDFS_HOME=/opt/cloudera/parcels/CDH-7.1.9-1.cdh7.1.9.p1069.74330271/lib/hadoop-hdfs
+LOGNAME=<user>
+JVM_PID=2180121
+HADOOP_MAPRED_HOME=/opt/cloudera/parcels/CDH-7.1.9-1.cdh7.1.9.p1069.74330271/lib/hadoop-mapreduce
+PWD=/hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>
+HADOOP_COMMON_HOME=/opt/cloudera/parcels/CDH-7.1.9-1.cdh7.1.9.p1069.74330271/lib/hadoop
+_=/usr/lib/jvm/jdk1.8.0_241/bin/java
+LOCAL_DIRS=/hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>
+APPLICATION_WEB_PROXY_BASE=/proxy/application_<app-id>
+NM_HTTP_PORT=8044
+HADOOP_CLIENT_CONF_DIR=/etc/hadoop/conf.cloudera.YARN-1
+LOG_DIRS=/hadoop/yarn/nm/logs/application_<app-id>/container_<container-id>
+PRELAUNCH_OUT=/hadoop/yarn/nm/logs/application_<app-id>/container_<container-id>/prelaunch.out
+NM_AUX_SERVICE_mapreduce_shuffle=<redacted>
+NM_PORT=8041
+USER=<user>
+HADOOP_YARN_HOME=/opt/cloudera/parcels/CDH-7.1.9-1.cdh7.1.9.p1069.74330271/lib/hadoop-yarn
+CLASSPATH=/hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>:/hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_⟪TRUNCATED-VIEWPORT⟫
+PRELAUNCH_ERR=/hadoop/yarn/nm/logs/application_<app-id>/container_<container-id>/prelaunch.err
+HADOOP_TOKEN_FILE_LOCATION=/hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>/container_tokens
+NM_AUX_SERVICE_spark_shuffle=
+LOCAL_USER_DIRS=/hadoop/yarn/nm/usercache/<user>/
+HADOOP_HOME=/opt/cloudera/parcels/CDH-7.1.9-1.cdh7.1.9.p1069.74330271/lib/hadoop
+NM_AUX_SERVICE_spark3_shuffle=
+SHLVL=1
+HOME=/home/
+MALLOC_ARENA_MAX=4
+CONTAINER_ID=container_<container-id>
+------------------------
+================================================================
+
+>>> Invoking Main class now >>>
+
+Launcher class: class org.apache.oozie.action.hadoop.Spark3Main
+INFO: loading log4j config file log4j.properties.
+INFO: log4j config file log4j.properties loaded successfully.
+oozie.launcher.propagated.hbase-site was not set in action configuration
+oozie.launcher.propagated.hive-site was not set in action configuration
+oozie.launcher.propagated.sqoop-site was not set in action configuration
+{"properties":[{"key":"oozie.launcher.job.id","value":"<wf-id>","isFinal":false,"resource":"programmatically"},{"key":"oozie.job.id","value":"<wf-id>","isFina⟪TRUNCATED-VIEWPORT⟫
+There is no `atlas-application.properties` added to the Oozie sharelib, therefore starting creating it.
+
+
+--- [PHOTO 3] --------------------------------------------------------
+
+Argument masking exception list: [hadoop.security.credential.provider.path]
+Fetching child yarn jobs
+tag id : <oozie-tag>
+No child applications found
+Setting up log4j2
+Creating /hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>/spark3-log4j2.properties
+log4j2 configuration file created at /hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>/spark3-log4j2.properties
+Reading Spark config propagated from Oozie server...
+Persisted merged Spark configs in file spark-defaults-oozie-generated.properties. Merged properties are: [spark.dynamicAllocation.minExecutors, spark.lineage.enabled, spark.driver.port, spark.shuffle.service.enabled, ⟪TRUNCATED-VIEWPORT⟫
+Spark Version 0.0
+Saving hbase-site.xml to /hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>/hbase-site.xml
+Adding hbase-site.xml to Spark Submit files
+Saving hive-site.xml to /hadoop/yarn/nm/usercache/<user>/appcache/application_<app-id>/container_<container-id>/hive-site.xml
+Adding hive-site.xml to Spark Submit files
+null
+java.lang.reflect.InvocationTargetException
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at org.apache.oozie.action.hadoop.LauncherAM.runActionMain(LauncherAM.java:419)
+	at org.apache.oozie.action.hadoop.LauncherAM.access$400(LauncherAM.java:57)
+	at org.apache.oozie.action.hadoop.LauncherAM$2.run(LauncherAM.java:234)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:422)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1910)
+	at org.apache.oozie.action.hadoop.LauncherAM.run(LauncherAM.java:228)
+	at org.apache.oozie.action.hadoop.LauncherAM$1.run(LauncherAM.java:158)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:422)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1910)
+	at org.apache.oozie.action.hadoop.LauncherAM.main(LauncherAM.java:146)
+Caused by: java.lang.NoClassDefFoundError: org/apache/spark/internal/Logging
+	at java.lang.ClassLoader.defineClass1(Native Method)
+	at java.lang.ClassLoader.defineClass(ClassLoader.java:756)
+	at java.security.SecureClassLoader.defineClass(SecureClassLoader.java:142)
+	at java.net.URLClassLoader.defineClass(URLClassLoader.java:468)
+	at java.net.URLClassLoader.access$100(URLClassLoader.java:74)
+	at java.net.URLClassLoader$1.run(URLClassLoader.java:369)
+	at java.net.URLClassLoader$1.run(URLClassLoader.java:363)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at java.net.URLClassLoader.findClass(URLClassLoader.java:362)
+	at java.lang.ClassLoader.loadClass(ClassLoader.java:418)
+	at sun.misc.Launcher$AppClassLoader.loadClass(Launcher.java:355)
+	at java.lang.ClassLoader.loadClass(ClassLoader.java:351)
+	at org.apache.oozie.action.hadoop.Spark3Main.run(Spark3Main.java:81)
+	at org.apache.oozie.action.hadoop.LauncherMain.run(LauncherMain.java:149)
+	at org.apache.oozie.action.hadoop.Spark3Main.main(Spark3Main.java:62)
+	... 16 more
+Caused by: java.lang.ClassNotFoundException: org.apache.spark.internal.Logging
+
+
+--- [PHOTO 4] --------------------------------------------------------
+
+Caused by: java.lang.ClassNotFoundException: org.apache.spark.internal.Logging
+	at java.net.URLClassLoader.findClass(URLClassLoader.java:382)
+	at java.lang.ClassLoader.loadClass(ClassLoader.java:418)
+	at sun.misc.Launcher$AppClassLoader.loadClass(Launcher.java:355)
+	at java.lang.ClassLoader.loadClass(ClassLoader.java:351)
+	... 31 more
+Failing Oozie Launcher, org/apache/spark/internal/Logging
+java.lang.NoClassDefFoundError: org/apache/spark/internal/Logging
+	at java.lang.ClassLoader.defineClass1(Native Method)
+	at java.lang.ClassLoader.defineClass(ClassLoader.java:756)
+	at java.security.SecureClassLoader.defineClass(SecureClassLoader.java:142)
+	at java.net.URLClassLoader.defineClass(URLClassLoader.java:468)
+	at java.net.URLClassLoader.access$100(URLClassLoader.java:74)
+	at java.net.URLClassLoader$1.run(URLClassLoader.java:369)
+	at java.net.URLClassLoader$1.run(URLClassLoader.java:363)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at java.net.URLClassLoader.findClass(URLClassLoader.java:362)
+	at java.lang.ClassLoader.loadClass(ClassLoader.java:418)
+	at sun.misc.Launcher$AppClassLoader.loadClass(Launcher.java:355)
+	at java.lang.ClassLoader.loadClass(ClassLoader.java:351)
+	at org.apache.oozie.action.hadoop.Spark3Main.run(Spark3Main.java:81)
+	at org.apache.oozie.action.hadoop.LauncherMain.run(LauncherMain.java:149)
+	at org.apache.oozie.action.hadoop.Spark3Main.main(Spark3Main.java:62)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at org.apache.oozie.action.hadoop.LauncherAM.runActionMain(LauncherAM.java:419)
+	at org.apache.oozie.action.hadoop.LauncherAM.access$400(LauncherAM.java:57)
+	at org.apache.oozie.action.hadoop.LauncherAM$2.run(LauncherAM.java:234)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:422)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1910)
+	at org.apache.oozie.action.hadoop.LauncherAM.run(LauncherAM.java:228)
+	at org.apache.oozie.action.hadoop.LauncherAM$1.run(LauncherAM.java:158)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:422)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1910)
+	at org.apache.oozie.action.hadoop.LauncherAM.main(LauncherAM.java:146)
+Caused by: java.lang.ClassNotFoundException: org.apache.spark.internal.Logging
+	at java.net.URLClassLoader.findClass(URLClassLoader.java:382)
+	at java.lang.ClassLoader.loadClass(ClassLoader.java:418)
+	at sun.misc.Launcher$AppClassLoader.loadClass(Launcher.java:355)
+	at java.lang.ClassLoader.loadClass(ClassLoader.java:351)
+	... 31 more
+Oozie Launcher, uploading action data to HDFS sequence file: hdfs://<nameservice>/user/<user>/oozie-oozi/<wf-id>/spark-4f31--spark3/action-data.seq
+2026-09-10 22:24:32,350 [main] INFO  org.apache.hadoop.io.compress.CodecPool [] - Got brand-new compressor [.deflate]
+Stopping AM
+2026-09-10 22:24:32,392 [main] INFO  org.apache.hadoop.yarn.client.api.impl.AMRMClientImpl [] - Waiting for application to be successfully unregistered.
+Callback notification attempts left 0
+Multiple callback urls are defined thus https://<host-vip>:11443/oozie/callback?id=<wf-id>@spark-4f31&status=FAILED will be ignored and one of the followings should su⟪TRUNCATED-VIEWPORT⟫
+Callback notification trying https://<host-a>:11443/oozie/callback?id=<wf-id>@spark-4f31&status=FAILED
+Setting-up a secure callback notification
+Callback notification to https://<host-a>:11443/oozie/callback?id=<wf-id>@spark-4f31&status=FAILED succeeded
+Callback notification succeeded
+
+
+=====================================================================
+EXTRACTION NOTES / ANOMALIES
+=====================================================================
+
+[A1] `Spark Version 0.0` — reported by Spark3Main before the failure.
+     Real value in the log, not an OCR artefact. Consistent with the
+     Spark3 sharelib not being resolvable on the launcher classpath.
+
+[A2] `SPARK_HOME=.` — literal single dot in the environment block.
+
+[A3] `NM_AUX_SERVICE_spark_shuffle=` and `NM_AUX_SERVICE_spark3_shuffle=`
+     are both empty; `NM_AUX_SERVICE_mapreduce_shuffle` is populated.
+
+[A4] `HOME=/home/` (trailing slash, no user) while `user.home=/home/<user>`
+     in the system-properties block. Discrepancy is in the source log.
+
+[B1] `NM_AUX_SERVICE_mapreduce_shuffle` base64 value: the run of `A`
+     characters was counted from the photo; exact count is LOW CONFIDENCE.
+
+[B2] `tag id : <oozie-tag>`
+     — long hex string, OCR-derived. MEDIUM confidence. Re-verify before
+     any use (per the standing rule: never hardcode OCR-derived IDs).
+
+[B3] Workflow id (redacted here as `<wf-id>`) — its middle digit run was
+     MEDIUM confidence: identical in 5 places across photos 2–4, which
+     raises confidence, but the photos are all the same rendering.
+
+[B4] The Oozie VIP hostname (redacted here as `<host-vip>`) was LOW
+     confidence: two of its segments were barely legible and the trailing
+     one looked truncated; the line itself is cut off at the viewport edge.
+
+[C1] Photo 1 top: the `------------------------` separator and the
+     section heading above it (presumably `System properties`) are
+     scrolled off. Not transcribed.
+
+[C2] Photos 2 and 3 overlap (the block from `Launcher class:` through
+     `There is no atlas-application.properties...`). Transcribed once,
+     under Photo 2. Photo 3 begins here at `Argument masking...`.
+
+[C3] Photos 3 and 4 overlap at `Caused by: java.lang.ClassNotFoundException:
+     org.apache.spark.internal.Logging`. Photo 3 ends on that line with the
+     frames off-screen; the full frame list is taken from Photo 4.
