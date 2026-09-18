@@ -4,6 +4,7 @@
 **Goal:** during the 3.3.2 → 3.5.4 migration, the same
 `str_projection_engine` jar must run on both runtimes
 **Chosen fix:** bean encoder — no reflection, no version-specific API (§2)
+**Call sites:** two, `StepGetMacroVar` and `LgdFwdStepGetMacroVar`, identical patch (§2.3)
 **Status:** written and verified on both versions (§4)
 **Date:** 2026-09-18
 
@@ -56,7 +57,21 @@ sectorializable lookup, the "duplicate across all sectors" rule, the
 This also removes the `Object[] values = {...}` / `RowFactory` indirection, so a field
 order mistake becomes a compile error instead of a wrong column.
 
-### 2.3 `StepGetMacroVar` — [`code/fix/StepGetMacroVar_importVarMacroEcoFromCsv.java`](code/fix/StepGetMacroVar_importVarMacroEcoFromCsv.java)
+### 2.3 The two call sites — identical patch
+
+`importVarMacroEcoFromCsv` exists twice, character for character (`diff` of the
+deployed sources reports no difference), each class carrying its own private
+`getTmpEncoder`, `castDoubleColumn` and `computeSectoredVarNames`:
+
+| Class | Patch |
+|---|---|
+| `…steps.defaultRates.StepGetMacroVar` | [`code/fix/StepGetMacroVar_importVarMacroEcoFromCsv.java`](code/fix/StepGetMacroVar_importVarMacroEcoFromCsv.java) |
+| `…steps.lgdForward.LgdFwdStepGetMacroVar` | [`code/fix/LgdFwdStepGetMacroVar_importVarMacroEcoFromCsv.java`](code/fix/LgdFwdStepGetMacroVar_importVarMacroEcoFromCsv.java) |
+
+The patch below is written against `StepGetMacroVar`; the second file is the same
+edit in the other class. §2.5 explains why both must be done in the same commit.
+
+### 2.4 The patch — [`code/fix/StepGetMacroVar_importVarMacroEcoFromCsv.java`](code/fix/StepGetMacroVar_importVarMacroEcoFromCsv.java)
 
 `getTmpEncoder` is deleted. Inside `importVarMacroEcoFromCsv`:
 
@@ -88,7 +103,43 @@ two `withColumnRenamed` calls, the final `as(Encoders.bean(MacroVar.class))` —
 unchanged, because the select hands it exactly the column names and order the Row
 encoder used to produce.
 
-### 2.4 Why the select is needed — the two objections, answered
+### 2.5 Both call sites, one commit — not optional
+
+`VarMacroConverter` is shared by the two classes, and §2.2 changes its return type.
+So the moment the converter emits beans, `LgdFwdStepGetMacroVar` stops compiling:
+its `flatMap(flattener::flattenVarRow, Encoder<Row>)` no longer type-checks. There is
+no "fix one now, one later" path — the compiler enforces the pair.
+
+That is also the reassuring part: the failure mode is a compile error in CI, not a
+`NoSuchMethodError` on a cluster at 14:11.
+
+> **A-01 — unverified assumption.** `LgdFwdStepGetMacroVar.getTmpEncoder` sits in the
+> region not captured in the screenshots (source lines 1-152). The patch assumes it
+> builds the same five-field schema as the one in `StepGetMacroVar`. Confirm before
+> applying: if that class builds a different schema, `MacroVarFlat` does not fit it
+> and that call site needs its own bean. Everything visible — the identical
+> `importVarMacroEcoFromCsv`, the shared `VarMacroConverter`, the same
+> `as(Encoders.bean(MacroVar.class))` at the end — says it is the same five fields.
+
+### 2.6 Worth doing while you are here: delete one of the copies
+
+Two identical 25-line methods, two identical `getTmpEncoder`s, two identical
+`castDoubleColumn`s and two identical `computeSectoredVarNames`es (a third copy of
+that one sits in `VarMacroConverter` itself). This duplication is why a one-line Spark
+API change became a two-class fix.
+
+A static helper — `MacroVarCsvLoader.load(sc, filepath, varNameList, sectors, commonVarNames)`
+returning `Dataset<MacroVar>` — collapses both call sites into one, and the next
+version-sensitive change lands in a single place. Each step then calls:
+
+```java
+return MacroVarCsvLoader.load(sc, filepath, varNameList, sectors, commonVarNames);
+```
+
+Not folded into this fix: it moves code across packages and deserves its own review
+and its own commit. Do the migration fix first, the extraction second.
+
+### 2.7 Why the select is needed — the two objections, answered
 
 **Runtime column names.** `colDate` and `colScenario` come from the CSV header
 (`colsTmp[0]`, `colsTmp[1]`), and a Java bean cannot have runtime-determined property
@@ -162,6 +213,10 @@ final nullability = scenario:null Variable:null sector:null Date:NOTNULL Value:N
 Same column order, same schema, same nullability, same rows — from the **same class
 files** on both classpaths.
 
+This covers both call sites: the patched method bodies in §2.3 are identical, so the
+run exercises the code of each. What it does not cover is the assumption in A-01,
+that `LgdFwdStepGetMacroVar.getTmpEncoder` builds the same schema.
+
 Re-run it with:
 
 ```bash
@@ -214,10 +269,11 @@ that will `NoSuchMethodError` on the old cluster. Known 3.4/3.5 removals to look
 | `ExpressionEncoder` as a declared type | keep variables typed as `Encoder<T>`, never the concrete class |
 | `Dataset.unpivot` / `melt` (3.4+) | not on 3.3 — use `stack()` SQL |
 
-**Caller sweep for this change:** `grep -rn "flattenVarRow"` across the module.
-Anything that consumed `Iterator<Row>` from it — tests especially — now gets
-`Iterator<MacroVarFlat>` and must be updated. The compiler finds all of them; this is
-only a reminder that the blast radius is not just the one step.
+**Caller sweep for this change:** `grep -rn "flattenVarRow\|getTmpEncoder\|Encoders.row"`
+across the module. Over the sources collected here it returns two step classes
+(§2.3) plus `VarMacroConverter` itself, all handled. Run it against the real module —
+anything else that consumed `Iterator<Row>` from the converter, tests especially, now
+gets `Iterator<MacroVarFlat>` and must be updated. The compiler finds all of them.
 
 ---
 
